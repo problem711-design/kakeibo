@@ -10,7 +10,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.my.myapplication"
+        applicationId = "com.my.kakeiboplus"
         minSdk = 24
         targetSdk = 37
         versionCode = 1
