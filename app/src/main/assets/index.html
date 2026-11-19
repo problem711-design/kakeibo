@@ -173,7 +173,7 @@
 <!-- 予算未設定警告（EXP以外で予算0の時に表示） -->
 <div id="summary-no-budget" style="display:none;" class="summary-no-budget">
 ⚠️ 基本月予算が未設定です<br>
-<span>設定4で予算を入力してください</span>
+<span>設定5「予算・固定費の管理」で設定してください</span>
 </div>
 <!-- 支出額（EXP / BOTH時に表示） -->
 <div class="summary-value" id="summary-total">¥ 0</div>
@@ -428,7 +428,7 @@ class="day-input" onchange="onSettingSelectChange(this.id)">
 </div>
 
 <div class="section-card" id="acct-settings-section">
-<div class="s-num-label"><span class="s-num">6</span>アカウント管理</div>
+<div class="s-num-label"><span class="s-num">7</span>アカウント管理</div>
 <div class="s-sub-label">アカウント切り替え・名称変更</div>
 <div id="acct-settings-list">
 <!-- JS で生成 -->
@@ -436,7 +436,7 @@ class="day-input" onchange="onSettingSelectChange(this.id)">
 </div>
 
 <div class="section-card">
-<div class="s-num-label"><span class="s-num">7</span>データ管理</div>
+<div class="s-num-label"><span class="s-num">8</span>データ管理</div>
 <div class="s-sub-label">バックアップ・書き出し</div>
 <button class="sub-btn" onclick="vibe();doExport()">📤 JSONファイルにエクスポート</button>
 <div style="font-size:11px;color:var(--text-sub);margin:4px 0 12px 2px;">端末の「外部ストレージ / kakeibo_backup_*.json」に保存</div>

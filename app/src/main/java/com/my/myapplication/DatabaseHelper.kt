@@ -569,10 +569,12 @@ put("tag_id",     tagId)
 // ----------------------------------------------------------
 fun getRecords(offset: Int): String {
 val sql = """
-SELECT e.*, c.name as cat_name, pc.name as card_name
+SELECT e.*, c.name as cat_name, COALESCE(pc.name, ct.name) as card_name,
+CASE WHEN ct.id IS NOT NULL THEN 1 ELSE 0 END as is_cost_tag
 FROM expenses e
 LEFT JOIN categories  c  ON e.category_id = c.id
 LEFT JOIN point_cards pc ON e.card_id = pc.id
+LEFT JOIN cost_tags   ct ON e.card_id = ct.id
 ORDER BY e.date DESC, e.id DESC
 LIMIT 20 OFFSET ?
 """
@@ -648,10 +650,12 @@ val whereStr = if (where.isEmpty()) "" else "WHERE ${where.joinToString(" AND ")
 val orderStr = buildOrderClause(f)
 
 val sql = """
-SELECT e.*, c.name as cat_name, pc.name as card_name
+SELECT e.*, c.name as cat_name, COALESCE(pc.name, ct.name) as card_name,
+CASE WHEN ct.id IS NOT NULL THEN 1 ELSE 0 END as is_cost_tag
 FROM expenses e
 LEFT JOIN categories  c  ON e.category_id = c.id
 LEFT JOIN point_cards pc ON e.card_id = pc.id
+LEFT JOIN cost_tags   ct ON e.card_id = ct.id
 $whereStr
 $orderStr
 LIMIT 20 OFFSET ?
@@ -697,12 +701,16 @@ if (dateTo.isNotEmpty() && expDate > dateTo) continue
 if (skipped < offset) { skipped++; continue }
 if (matched >= 20) break
 
+val cardIdVal = dataObj.optInt("card_id")
+val pcName = getMasterName("point_cards", cardIdVal)
+val ctName = if (pcName.isEmpty() && cardIdVal > 0) getMasterName("cost_tags", cardIdVal) else ""
 list.put(JSONObject().apply {
 put("id",        logId)
 put("timestamp", ts)
 put("original",  dataObj)
 put("category",  getMasterName("categories",  dataObj.optInt("category_id")))
-put("card",      getMasterName("point_cards", dataObj.optInt("card_id")))
+put("card",      pcName.ifEmpty { ctName })
+put("is_cost_tag", if (ctName.isNotEmpty()) 1 else 0)
 put("tags",      resolveTagNames(dataObj.optString("tag_ids")))
 })
 matched++
@@ -790,12 +798,16 @@ while (cursor.moveToNext()) {
 val logId   = cursor.getInt(0)
 val ts      = cursor.getString(1)
 val dataObj = runCatching { JSONObject(cursor.getString(2)) }.getOrNull() ?: continue
+val cardIdVal = dataObj.optInt("card_id")
+val pcName = getMasterName("point_cards", cardIdVal)
+val ctName = if (pcName.isEmpty() && cardIdVal > 0) getMasterName("cost_tags", cardIdVal) else ""
 list.put(JSONObject().apply {
 put("id",        logId)
 put("timestamp", ts)
 put("original",  dataObj)
 put("category",  getMasterName("categories",  dataObj.optInt("category_id")))
-put("card",      getMasterName("point_cards", dataObj.optInt("card_id")))
+put("card",      pcName.ifEmpty { ctName })
+put("is_cost_tag", if (ctName.isNotEmpty()) 1 else 0)
 put("tags",      resolveTagNames(dataObj.optString("tag_ids")))
 })
 }
@@ -1059,19 +1071,27 @@ context.contentResolver.update(uri, values, null, null)
 
 db.beginTransaction()
 try {
-// ★ 完全置換: expenses / action_logs / expense_tags を全削除してから挿入
+// ★ 完全置換: 全テーブルをクリーンにしてからバックアップを復元
 db.execSQL("DELETE FROM expense_tags")
 db.execSQL("DELETE FROM expenses")
 db.execSQL("DELETE FROM action_logs")
 db.execSQL("DELETE FROM budget_periods")
 db.execSQL("DELETE FROM budget_extras")
 db.execSQL("DELETE FROM fixed_cost_history")
+db.execSQL("DELETE FROM fixed_costs")
+if (root.has("settings")) {
+db.execSQL("DELETE FROM settings")
+}
 // AUTOINCREMENT のカウンタをリセット
-db.execSQL("DELETE FROM sqlite_sequence WHERE name IN ('expenses','action_logs','expense_tags','budget_extras','fixed_cost_history')")
+db.execSQL("DELETE FROM sqlite_sequence WHERE name IN ('expenses','action_logs','expense_tags','budget_extras','fixed_cost_history','fixed_costs')")
 
-// マスターテーブル（categories / custom_tags / point_cards は upsert）
+// マスターテーブル（バックアップに配列が存在すれば置換、空の旧データは既存保持）
 listOf("categories","custom_tags","point_cards","cost_tags").forEach { table ->
 root.optJSONArray(table)?.let { arr ->
+if (table == "cost_tags" || arr.length() > 0) {
+db.execSQL("DELETE FROM $table")
+db.execSQL("DELETE FROM sqlite_sequence WHERE name = ?", arrayOf(table))
+}
 for (i in 0 until arr.length()) {
 val o = arr.getJSONObject(i)
 // id が文字列でも数値でも安全に取得
@@ -1084,6 +1104,13 @@ put("name", o.optString("name"))
 }
 }
 }
+
+// cost_tags の採番開始位置が 10001〜（seq >= 9999）になるよう保証
+val ctSeqCur = db.rawQuery("SELECT COALESCE(MAX(id), 9999) FROM cost_tags", null)
+val maxCtId = if (ctSeqCur.moveToFirst()) maxOf(9999, ctSeqCur.getInt(0)) else 9999
+ctSeqCur.close()
+db.execSQL("DELETE FROM sqlite_sequence WHERE name = 'cost_tags'")
+db.execSQL("INSERT INTO sqlite_sequence (name, seq) VALUES ('cost_tags', ?)", arrayOf(maxCtId.toString()))
 
 // 支出テーブル（全削除済みなので INSERT のみ）
 root.optJSONArray("expenses")?.let { arr ->
@@ -1104,6 +1131,8 @@ put("points",      n("points"))
 put("card_id",     n("card_id"))
 put("created_at",  s("created_at"))
 put("updated_at",  s("updated_at"))
+val ra = s("restored_at")
+if (ra.isNotEmpty()) put("restored_at", ra)
 })
 syncExpenseTags(db, id, s("tag_ids"))
 }
@@ -1128,9 +1157,11 @@ root.optJSONArray("budget_periods")?.let { arr ->
 for (i in 0 until arr.length()) {
 val o = arr.getJSONObject(i)
 fun s(k: String) = o.optString(k).let { if (it == "null") "" else it }
+val pf = s("period_from")
+if (pf.isEmpty()) continue
 db.insertWithOnConflict("budget_periods", null,
 ContentValues().apply {
-put("period_from", s("period_from"))
+put("period_from", pf)
 put("period_to",   s("period_to"))
 put("amount",      o.opt("amount").toString().toIntOrNull() ?: 0)
 put("created_at",  s("created_at"))
@@ -1143,8 +1174,9 @@ root.optJSONArray("budget_extras")?.let { arr ->
 for (i in 0 until arr.length()) {
 val o = arr.getJSONObject(i)
 fun s(k: String) = o.optString(k).let { if (it == "null") "" else it }
+val id = o.opt("id").toString().toIntOrNull() ?: continue
 db.insert("budget_extras", null, ContentValues().apply {
-put("id",          o.opt("id").toString().toIntOrNull() ?: return@let)
+put("id",          id)
 put("period_from", s("period_from"))
 put("name",        s("name"))
 put("amount",      o.opt("amount").toString().toIntOrNull() ?: 0)
@@ -1153,14 +1185,33 @@ put("created_at",  s("created_at"))
 }
 }
 
-// fixed_cost_history
-root.optJSONArray("fixed_cost_history")?.let { arr ->
+// fixed_costs（旧バージョン互換およびエクスポートデータ完全復元）
+root.optJSONArray("fixed_costs")?.let { arr ->
 for (i in 0 until arr.length()) {
 val o = arr.getJSONObject(i)
 fun s(k: String) = o.optString(k).let { if (it == "null") "" else it }
+val id = o.opt("id").toString().toIntOrNull() ?: continue
+db.insert("fixed_costs", null, ContentValues().apply {
+put("id",          id)
+put("name",        s("name"))
+put("amount",      o.opt("amount").toString().toIntOrNull() ?: 0)
+put("category_id", o.opt("category_id").toString().toIntOrNull() ?: 0)
+put("is_active",   o.opt("is_active").toString().toIntOrNull() ?: 1)
+put("created_at",  s("created_at"))
+})
+}
+}
+
+// fixed_cost_history
+val fchArr = root.optJSONArray("fixed_cost_history")
+if (fchArr != null) {
+for (i in 0 until fchArr.length()) {
+val o = fchArr.getJSONObject(i)
+fun s(k: String) = o.optString(k).let { if (it == "null") "" else it }
+val id = o.opt("id").toString().toIntOrNull() ?: continue
 val vt = s("valid_to").ifBlank { null }
 db.insert("fixed_cost_history", null, ContentValues().apply {
-put("id",          o.opt("id").toString().toIntOrNull() ?: return@let)
+put("id",          id)
 put("name",        s("name"))
 put("amount",      o.opt("amount").toString().toIntOrNull() ?: 0)
 put("category_id", o.opt("category_id").toString().toIntOrNull() ?: 0)
@@ -1169,13 +1220,31 @@ put("valid_to",    vt)
 put("created_at",  s("created_at"))
 })
 }
+} else {
+// v31以前のバックアップ互換: fixed_costs (is_active=1) を fixed_cost_history に移行
+val fcCur = db.rawQuery("SELECT name, amount, category_id FROM fixed_costs WHERE is_active=1", null)
+while (fcCur.moveToNext()) {
+db.insert("fixed_cost_history", null, ContentValues().apply {
+put("name",        fcCur.getString(0))
+put("amount",      fcCur.getInt(1))
+put("category_id", fcCur.getInt(2))
+put("valid_from",  "2000-01-01")
+put("valid_to",    null as String?)
+})
+}
+fcCur.close()
 }
 
-// settings（追記 upsert）
+// settings
 root.optJSONArray("settings")?.let { arr ->
 for (i in 0 until arr.length()) {
 val o = arr.getJSONObject(i)
-setSetting(o.optString("key"), o.optString("value"))
+val k = o.optString("key")
+if (k.isNotEmpty()) {
+db.insertWithOnConflict("settings", null,
+ContentValues().apply { put("key", k); put("value", o.optString("value")) },
+SQLiteDatabase.CONFLICT_REPLACE)
+}
 }
 }
 
@@ -1217,6 +1286,8 @@ val f      = JSONObject(filterJson)
 val catIds = f.optJSONArray("categoryIds")
 val tagIds = f.optJSONArray("tagIds")
 val memo   = f.optString("memo", "")
+val excludeCost = f.optBoolean("excludeCostTags", false)
+val onlyCost    = f.optBoolean("onlyCostTags", false)
 
 val extraArgs  = mutableListOf<String>()
 val extraWhere = mutableListOf<String>()
@@ -1233,6 +1304,11 @@ extraWhere.add("EXISTS (SELECT 1 FROM expense_tags et WHERE et.expense_id=e.id A
 if (memo.isNotBlank()) {
 extraWhere.add("e.name LIKE ?")
 extraArgs.add("%$memo%")
+}
+if (excludeCost) {
+extraWhere.add("e.card_id NOT IN (SELECT id FROM cost_tags)")
+} else if (onlyCost) {
+extraWhere.add("e.card_id IN (SELECT id FROM cost_tags)")
 }
 val extraWhereStr = if (extraWhere.isEmpty()) "" else "AND ${extraWhere.joinToString(" AND ")}"
 
@@ -1287,6 +1363,8 @@ val f      = JSONObject(filterJson)
 val catIds = f.optJSONArray("categoryIds")
 val tagIds = f.optJSONArray("tagIds")
 val memo   = f.optString("memo", "")
+val excludeCost = f.optBoolean("excludeCostTags", false)
+val onlyCost    = f.optBoolean("onlyCostTags", false)
 
 val extraArgs  = mutableListOf<String>()
 val extraWhere = mutableListOf<String>()
@@ -1304,13 +1382,20 @@ if (memo.isNotBlank()) {
 extraWhere.add("e.name LIKE ?")
 extraArgs.add("%$memo%")
 }
+if (excludeCost) {
+extraWhere.add("e.card_id NOT IN (SELECT id FROM cost_tags)")
+} else if (onlyCost) {
+extraWhere.add("e.card_id IN (SELECT id FROM cost_tags)")
+}
 val extraWhereStr = if (extraWhere.isEmpty()) "" else "AND ${extraWhere.joinToString(" AND ")}"
 
 val result  = JSONArray()
 val db      = readableDatabase
 val sdf     = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
-val calFrom = java.util.Calendar.getInstance().also { it.time = sdf.parse(dateFrom) ?: java.util.Date() }
-val calTo   = java.util.Calendar.getInstance().also { it.time = sdf.parse(dateTo)   ?: java.util.Date() }
+val parsedFrom = runCatching { sdf.parse(dateFrom) }.getOrNull() ?: return "[]"
+val parsedTo   = runCatching { sdf.parse(dateTo) }.getOrNull()   ?: return "[]"
+val calFrom = java.util.Calendar.getInstance().also { it.time = parsedFrom }
+val calTo   = java.util.Calendar.getInstance().also { it.time = parsedTo }
 calFrom.set(java.util.Calendar.DAY_OF_MONTH, 1)
 calTo.set(java.util.Calendar.DAY_OF_MONTH, 1)
 
@@ -1376,6 +1461,8 @@ val f = JSONObject(filterJson)
 val catIds = f.optJSONArray("categoryIds")
 val tagIds = f.optJSONArray("tagIds")
 val memo   = f.optString("memo", "")
+val excludeCost = f.optBoolean("excludeCostTags", false)
+val onlyCost    = f.optBoolean("onlyCostTags", false)
 
 val extraArgs  = mutableListOf<String>()
 val extraWhere = mutableListOf<String>()
@@ -1393,11 +1480,16 @@ if (memo.isNotBlank()) {
 extraWhere.add("e.name LIKE ?")
 extraArgs.add("%$memo%")
 }
+if (excludeCost) {
+extraWhere.add("e.card_id NOT IN (SELECT id FROM cost_tags)")
+} else if (onlyCost) {
+extraWhere.add("e.card_id IN (SELECT id FROM cost_tags)")
+}
 val extraWhereStr = if (extraWhere.isEmpty()) "" else "AND ${extraWhere.joinToString(" AND ")}"
 
 val sdf   = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
-val from  = sdf.parse(dateFrom) ?: return "[]"
-val to    = sdf.parse(dateTo)   ?: return "[]"
+val from  = runCatching { sdf.parse(dateFrom) }.getOrNull() ?: return "[]"
+val to    = runCatching { sdf.parse(dateTo) }.getOrNull()   ?: return "[]"
 val db    = readableDatabase
 val result= JSONArray()
 val cal   = java.util.Calendar.getInstance().also { it.time = from }
@@ -1427,6 +1519,8 @@ val dateTo   = f.optString("dateTo",   "")
 val tagIds   = f.optJSONArray("tagIds")
 val catIds   = f.optJSONArray("categoryIds")
 val memo     = f.optString("memo", "")
+val excludeCost = f.optBoolean("excludeCostTags", false)
+val onlyCost    = f.optBoolean("onlyCostTags", false)
 
 val args  = mutableListOf<String>()
 val where = mutableListOf<String>()
@@ -1445,6 +1539,11 @@ where.add("e.category_id IN ($ph)")
 if (memo.isNotBlank()) {
 where.add("e.name LIKE ?")
 args.add("%$memo%")
+}
+if (excludeCost) {
+where.add("e.card_id NOT IN (SELECT id FROM cost_tags)")
+} else if (onlyCost) {
+where.add("e.card_id IN (SELECT id FROM cost_tags)")
 }
 val whereStr = if (where.isEmpty()) "" else "WHERE ${where.joinToString(" AND ")}"
 
@@ -1479,7 +1578,11 @@ val tagIds   = f.optJSONArray("tagIds")
 val memo     = f.optString("memo", "")
 
 val args  = mutableListOf<String>()
-val where = mutableListOf<String>("e.card_id > 0")
+val where = mutableListOf<String>(
+"e.card_id > 0",
+"e.card_id < 10000",
+"e.card_id NOT IN (SELECT id FROM cost_tags)"
+)
 if (dateFrom.isNotEmpty()) { where.add("e.date >= ?"); args.add(dateFrom) }
 if (dateTo.isNotEmpty())   { where.add("e.date <= ?"); args.add(dateTo)   }
 if (catIds != null && catIds.length() > 0) {
@@ -1573,6 +1676,14 @@ val cursor = db.rawQuery("SELECT datetime('now','localtime')", null)
 val v = if (cursor.moveToFirst()) cursor.getString(0) else ""
 cursor.close()
 return v
+}
+
+/** 最古の支出日付（YYYY-MM-DD）を1クエリで返す（未登録時は ""） */
+fun getEarliestExpenseDate(): String {
+val cursor = readableDatabase.rawQuery("SELECT MIN(date) FROM expenses WHERE date IS NOT NULL AND date != ''", null)
+val d = if (cursor.moveToFirst()) (cursor.getString(0) ?: "") else ""
+cursor.close()
+return d
 }
 
 // ----------------------------------------------------------

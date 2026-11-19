@@ -156,6 +156,15 @@ function attemptInitialization() {
 if (typeof DB !== "undefined") { initApp(); } else { setTimeout(attemptInitialization, 200); }
 }
 
+function _escHtml(s) {
+return String(s ?? '')
+.replace(/&/g, '&amp;')
+.replace(/</g, '&lt;')
+.replace(/>/g, '&gt;')
+.replace(/"/g, '&quot;')
+.replace(/'/g, '&#39;');
+}
+
 function initApp() {
 if (isInitialized) return;
 isInitialized = true;
@@ -171,7 +180,9 @@ loadSettingsFromDB();
 } catch(e) { console.error('loadSettingsFromDB:', e); }
 try { initAccount(); }        catch(e) { console.error('initAccount:', e); }
 try { refresh(); }            catch(e) { console.error('refresh:', e); }
+try { _autoRolloverBudgetIfNeeded(); } catch(e) { console.error('autoRollover:', e); }
 try { updateSummary(); }      catch(e) { console.error('updateSummary:', e); }
+try { _renderBmCurrentSummary(); } catch(e) {}
 setTimeout(() => {
 try { renderInfoPanel(); } catch(e) { console.error('renderInfoPanel:', e); }
 // BM_MONTHLY / BM_ONCE: 期間開始日チェック
@@ -179,52 +190,98 @@ try { checkBudgetPeriodStart(); } catch(e) {}
 }, 300);
 }
 
-// ===== 期間開始チェック（BM_MONTHLY / BM_ONCE）=====
+// ===== BM_AUTO 自動繰り越し =====
+function _autoRolloverBudgetIfNeeded(periodOverride) {
+if (typeof DB === 'undefined') return false;
+if ((S.budgetMode || 'BM_AUTO') !== 'BM_AUTO') return false;
+if (typeof DB.getBudgetForPeriod !== 'function') return false;
+const period = periodOverride || getCurrentPeriod();
+let info;
+try {
+info = JSON.parse(DB.getBudgetForPeriod(period.from, period.to));
+} catch(e) { return false; }
+if (info.baseAmount >= 0) return false; // 既に設定済み
+
+const curDays = Math.round((_parseYmd(period.to) - _parseYmd(period.from)) / 86400000) + 1;
+const spanBucket = days => days <= 10 ? 'W' : days <= 35 ? 'M' : days <= 200 ? 'S' : 'Y';
+const curBucket = spanBucket(curDays);
+
+let rolledAmount = -1;
+try {
+const hist = JSON.parse(DB.getBudgetHistory(36) || '[]');
+for (const bp of hist) {
+if (!bp.periodFrom || bp.periodFrom >= period.from) continue;
+if (bp.baseAmount === undefined || bp.baseAmount < 0) continue;
+const bpDays = Math.round((_parseYmd(bp.periodTo) - _parseYmd(bp.periodFrom)) / 86400000) + 1;
+if (spanBucket(bpDays) === curBucket) {
+rolledAmount = bp.baseAmount;
+break;
+}
+}
+if (rolledAmount < 0 && hist.length === 0) {
+// v31以前からの移行フォールバック（budget_periodsが空のときのみ）
+const legacy = parseInt(S.baseBudget);
+if (!isNaN(legacy) && legacy >= 0 && S.baseBudget !== '') {
+rolledAmount = legacy;
+}
+}
+} catch(e) {}
+
+if (rolledAmount >= 0) {
+DB.setBudgetBase(period.from, period.to, rolledAmount);
+S.baseBudget = String(rolledAmount);
+try { DB.setSetting('baseBudget', String(rolledAmount)); } catch(e) {}
+return true;
+}
+return false;
+}
+
+// ===== 期間開始チェック（BM_MONTHLY / BM_ONCE / BM_AUTO）=====
 function checkBudgetPeriodStart() {
 if (typeof DB === 'undefined') return;
 const mode = S.budgetMode || 'BM_AUTO';
-if (mode === 'BM_AUTO') return;
+if (mode === 'BM_AUTO') {
+if (_autoRolloverBudgetIfNeeded()) {
+updateSummary();
+_renderBmCurrentSummary();
+}
+return;
+}
 
 const period = getCurrentPeriod();
-const lastChecked = S._bmLastChecked || '';
+let lastChecked = S._bmLastChecked || '';
+if (!lastChecked) {
+try { lastChecked = DB.getSetting('bmLastChecked', '') || ''; } catch(e) {}
+}
 if (lastChecked === period.from) return;  // 同じ期間は1回のみ
 
 // 予算が設定されているか確認
 let hasBudget = false;
 try {
 const info = JSON.parse(DB.getBudgetForPeriod(period.from, period.to));
-hasBudget = info.totalAmount >= 0;
+hasBudget = info.baseAmount >= 0 || info.totalAmount >= 0;
 } catch(e) {}
 
-// BM_ONCE かつ前期間の予算が引き継がれていれば未設定扱いにしない
+S._bmLastChecked = period.from;
+try { DB.setSetting('bmLastChecked', period.from); } catch(e) {}
+
 // 未設定のときだけ通知
 if (!hasBudget) {
-S._bmLastChecked = period.from;
-if (mode === 'BM_MONTHLY') {
-// 予算管理モーダルに誘導
-showModal('💰 予算の設定', `新しい期間（${period.label}）が始まりました。<br>予算を設定してください。`, false, (r) => {
+const msgText = mode === 'BM_MONTHLY'
+? `新しい期間（${period.label}）が始まりました。<br>予算を設定してください。`
+: `新しい期間（${period.label}）が始まりました。<br>今期の予算を設定してください。`;
+showModal('💰 予算の設定', msgText, false, (r) => {
 if (r) { setTimeout(() => openBudgetManagerModal(), 200); }
 else {
-// キャンセル → 支出額のみ表示に切り替え
+// キャンセル → 支出額/売上額のみ表示に切り替え
 S.simpleView = 'EXP';
 DB.setSetting('simpleView', 'EXP');
+const svEl = document.getElementById('set-simple-view');
+if (svEl) svEl.value = 'EXP';
 updateSummary();
 }
 });
 document.getElementById('modal-ok').innerText = '設定する';
-} else if (mode === 'BM_ONCE') {
-showModal('💰 予算の設定', `新しい期間（${period.label}）が始まりました。<br>今月の予算を設定してください。`, false, (r) => {
-if (r) { setTimeout(() => openBudgetManagerModal(), 200); }
-else {
-S.simpleView = 'EXP';
-DB.setSetting('simpleView', 'EXP');
-updateSummary();
-}
-});
-document.getElementById('modal-ok').innerText = '設定する';
-}
-} else {
-S._bmLastChecked = period.from;
 }
 }
 
@@ -281,17 +338,169 @@ document.getElementById('memoArea').style.display = isMemoOpen ? 'block' : 'none
 document.getElementById('memoToggleBtn').innerText = isMemoOpen ? 'メモ ×' : 'メモ ＋';
 }
 
-// ===== サマリ =====
+// ===== 日付・締め日・シーズン共通計算ヘルパー =====
+function _pad2(n) { return String(n).padStart(2, '0'); }
+function _ymd(d) { return `${d.getFullYear()}-${_pad2(d.getMonth() + 1)}-${_pad2(d.getDate())}`; }
+function _todayYmd() { return _ymd(new Date()); }
+function _parseYmd(s) { return new Date(s + 'T00:00:00'); }
+function _lastDayOfMonth(y, m) { return new Date(y, m, 0).getDate(); } // m=1-indexed
+
+// 締日（closeY年closeM月anchor日）を月末とする1期間の {from, to, closeY, closeM} を返す
+// 開始日 = 前月の締日の翌日（anchor>=28でも日付が重複・欠損しない）
+function _calcClosingPeriodForMonth(closeY, closeM, anchor) {
+const py = closeM === 1 ? closeY - 1 : closeY;
+const pm = closeM === 1 ? 12 : closeM - 1;
+const prevCloseDay = Math.min(anchor, _lastDayOfMonth(py, pm));
+const fromDate = new Date(py, pm - 1, prevCloseDay + 1);
+const toDay = Math.min(anchor, _lastDayOfMonth(closeY, closeM));
+const toDate = new Date(closeY, closeM - 1, toDay);
+return {
+from: _ymd(fromDate),
+to:   _ymd(toDate),
+closeY,
+closeM,
+label: `${fromDate.getMonth() + 1}/${fromDate.getDate()}〜${toDate.getMonth() + 1}/${toDate.getDate()}`
+};
+}
+
+// 任意の日付 dateObj (Date) が属する締め期間を返す
+function _calcClosingPeriodForDate(dateObj, anchorOverride) {
+const anchor = parseInt(anchorOverride ?? S.periodStartDay) || 25;
+const cy = dateObj.getFullYear(), cm = dateObj.getMonth() + 1;
+const cDay = Math.min(anchor, _lastDayOfMonth(cy, cm));
+if (dateObj.getDate() <= cDay) {
+return _calcClosingPeriodForMonth(cy, cm, anchor);
+}
+const ny = cm === 12 ? cy + 1 : cy;
+const nm = cm === 12 ? 1 : cm + 1;
+return _calcClosingPeriodForMonth(ny, nm, anchor);
+}
+
+// 現在の期間開始日 currentFrom ("YYYY-MM-DD") から1期前の締め期間を返す
+function _calcPrevClosingPeriod(currentFrom, anchorOverride) {
+const anchor = parseInt(anchorOverride ?? S.periodStartDay) || 25;
+const d = _parseYmd(currentFrom);
+d.setDate(d.getDate() - 1);
+return _calcClosingPeriodForDate(d, anchor);
+}
+
+// 現在の期間終了日 currentTo ("YYYY-MM-DD") から1期後の締め期間を返す
+function _calcNextClosingPeriod(currentTo, anchorOverride) {
+const anchor = parseInt(anchorOverride ?? S.periodStartDay) || 25;
+const d = _parseYmd(currentTo);
+d.setDate(d.getDate() + 1);
+return _calcClosingPeriodForDate(d, anchor);
+}
+
+// シーズン期間計算（dateObj 基準、dir=0 で現在、±1 で前後シーズン）
+function _calcSeasonPeriod(dateObj, seasonType, useClosing, anchor, dir = 0) {
+let refY, refM;
+if (useClosing) {
+const cp = _calcClosingPeriodForDate(dateObj, anchor);
+refY = cp.closeY;
+refM = cp.closeM;
+} else {
+refY = dateObj.getFullYear();
+refM = dateObj.getMonth() + 1;
+}
+
+let startY, startM, endY, endM, label;
+if (seasonType === 'H') {
+let idx = refM <= 6 ? 0 : 1;
+let totalH = refY * 2 + idx + dir;
+startY = Math.floor(totalH / 2);
+const hIdx = ((totalH % 2) + 2) % 2;
+startM = hIdx === 0 ? 1 : 7;
+endY = startY;
+endM = hIdx === 0 ? 6 : 12;
+label = `${startY}年 ${hIdx === 0 ? '上半期' : '下半期'}`;
+} else if (seasonType === 'FY') {
+const curFyStart = refM >= 4 ? refY : refY - 1;
+startY = curFyStart + dir;
+startM = 4;
+endY = startY + 1;
+endM = 3;
+label = `${startY}年度`;
+} else {
+// 'Q': 四半期
+const qIdx = Math.floor((refM - 1) / 3);
+const totalQ = refY * 4 + qIdx + dir;
+startY = Math.floor(totalQ / 4);
+const q = ((totalQ % 4) + 4) % 4;
+startM = q * 3 + 1;
+endY = startY;
+endM = startM + 2;
+label = `${startY}年 Q${q + 1}`;
+}
+
+if (useClosing) {
+const pStart = _calcClosingPeriodForMonth(startY, startM, anchor);
+const pEnd   = _calcClosingPeriodForMonth(endY, endM, anchor);
+return { from: pStart.from, to: pEnd.to, label, mode: 'SEASON' };
+}
+return {
+from: `${startY}-${_pad2(startM)}-01`,
+to:   `${endY}-${_pad2(endM)}-${_pad2(_lastDayOfMonth(endY, endM))}`,
+label,
+mode: 'SEASON'
+};
+}
+
+// 固定費の参照月初日 (YYYY-MM-01) を統一計算
+function _getFixedLookupDate(periodFrom, periodTo, useClosing) {
+if (useClosing && periodFrom && periodTo) {
+const from = _parseYmd(periodFrom);
+const to   = _parseYmd(periodTo);
+const mid  = new Date((from.getTime() + to.getTime()) / 2);
+return `${mid.getFullYear()}-${_pad2(mid.getMonth() + 1)}-01`;
+}
+return periodFrom ? periodFrom.slice(0, 7) + '-01' : `${new Date().getFullYear()}-${_pad2(new Date().getMonth() + 1)}-01`;
+}
+
+// 現在期間に応じた固定費合計を取得（月・締めは1期分、シーズン・年は対象月数を合算）
+function _getPeriodFixedTotal(period) {
+if (!S.fixedOn || typeof DB === 'undefined') return 0;
+try {
+if (typeof DB.getFixedCostHistoryAt !== 'function') {
+return DB.getFixedCostsTotal() || 0;
+}
+if (period.mode === 'SEASON' || period.mode === 'YEAR') {
+let total = 0;
+if (S.closingOn && period.mode === 'SEASON') {
+const anchor = parseInt(S.periodStartDay) || 25;
+let cur = _calcClosingPeriodForDate(_parseYmd(period.from), anchor);
+for (let i = 0; i < 24 && cur.from <= period.to; i++) {
+const lookup = _getFixedLookupDate(cur.from, cur.to, true);
+const items = JSON.parse(DB.getFixedCostHistoryAt(lookup) || '[]');
+total += items.reduce((s, x) => s + x.amount, 0);
+cur = _calcNextClosingPeriod(cur.to, anchor);
+}
+} else {
+let y = parseInt(period.from.slice(0, 4)), m = parseInt(period.from.slice(5, 7));
+const endY = parseInt(period.to.slice(0, 4)), endM = parseInt(period.to.slice(5, 7));
+while (y < endY || (y === endY && m <= endM)) {
+const items = JSON.parse(DB.getFixedCostHistoryAt(`${y}-${_pad2(m)}-01`) || '[]');
+total += items.reduce((s, x) => s + x.amount, 0);
+m++; if (m > 12) { m = 1; y++; }
+}
+}
+return total;
+}
+const lookup = _getFixedLookupDate(period.from, period.to, S.closingOn);
+const items = JSON.parse(DB.getFixedCostHistoryAt(lookup) || '[]');
+return items.reduce((s, x) => s + x.amount, 0);
+} catch(e) {
+return typeof DB.getFixedCostsTotal === 'function' ? (DB.getFixedCostsTotal() || 0) : 0;
+}
+}
+
 // ===== 期間計算エンジン =====
 /**
 * 設定(S)に基づいて現在の集計期間 {from, to, label} を返す
 * from/to: "YYYY-MM-DD" 形式
 */
 function getCurrentPeriod() {
-const now  = new Date();
-const pad  = n => String(n).padStart(2, '0');
-const ymd  = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-const lastDay = (y, m) => new Date(y, m, 0).getDate(); // m=1-indexed
+const now = new Date();
 
 // ── 今週（月曜〜日曜） ──
 if (S.periodUnit === 'WEEK') {
@@ -299,8 +508,8 @@ const dow = now.getDay(); // 0=日, 1=月...
 const diffToMon = (dow === 0) ? -6 : 1 - dow; // 月曜への差分
 const mon = new Date(now); mon.setDate(now.getDate() + diffToMon);
 const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
-const from  = ymd(mon);
-const to    = ymd(sun);
+const from  = _ymd(mon);
+const to    = _ymd(sun);
 const label = `${mon.getMonth()+1}/${mon.getDate()}〜${sun.getMonth()+1}/${sun.getDate()}`;
 return { from, to, label, mode: 'WEEK' };
 }
@@ -308,55 +517,36 @@ return { from, to, label, mode: 'WEEK' };
 // ── 今年（1/1〜12/31） ──
 if (S.periodUnit === 'YEAR') {
 const y    = now.getFullYear();
-const from = `${y}-01-01`;
-const to   = `${y}-12-31`;
-return { from, to, label: `${y}年`, mode: 'YEAR' };
+return { from: `${y}-01-01`, to: `${y}-12-31`, label: `${y}年`, mode: 'YEAR' };
+}
+
+// ── シーズン（四半期・半期・年度） ──
+if (S.periodUnit === 'SEASON') {
+const anchor = parseInt(S.periodStartDay) || 25;
+return _calcSeasonPeriod(now, S.seasonType || 'Q', !!S.closingOn, anchor, 0);
 }
 
 // ── 締め日連動OFF → 月初基準（1日〜月末） ──
 if (!S.closingOn) {
-const y = now.getFullYear(), m = now.getMonth()+1;
-const from = `${y}-${pad(m)}-01`;
-const to   = `${y}-${pad(m)}-${pad(lastDay(y, m))}`;
+const y = now.getFullYear(), m = now.getMonth() + 1;
+const from = `${y}-${_pad2(m)}-01`;
+const to   = `${y}-${_pad2(m)}-${_pad2(_lastDayOfMonth(y, m))}`;
 return { from, to, label: `${m}月`, mode: 'MONTH' };
 }
 
 // ── 締め日/給与日ベースの期間計算 ──
 const anchor = parseInt(S.periodStartDay) || 25;
-// 各月ごとに lastDay でクランプ（29〜31日設定 + 2月うるう年対応）
-const cy = now.getFullYear(), cm = now.getMonth() + 1;
-const anchorThisMonth = Math.min(anchor, lastDay(cy, cm));
-
-const todayDate = now.getDate();
-let fromDate, toDate;
-
-if (todayDate <= anchorThisMonth) {
-// 前月起点：前月の(anchor+1)日 〜 今月のanchor日
-const py = cm === 1 ? cy - 1 : cy, pm = cm === 1 ? 12 : cm - 1;
-const fromDay = Math.min(anchor + 1, lastDay(py, pm));
-fromDate = new Date(py, pm - 1, fromDay);
-const toDay = Math.min(anchor, lastDay(cy, cm));
-toDate = new Date(cy, cm - 1, toDay);
-} else {
-// 今月起点：今月の(anchor+1)日 〜 来月のanchor日
-const fromDay = Math.min(anchor + 1, lastDay(cy, cm));
-fromDate = new Date(cy, cm - 1, fromDay);
-const ny = cm === 12 ? cy + 1 : cy, nm = cm === 12 ? 1 : cm + 1;
-const toDay = Math.min(anchor, lastDay(ny, nm));
-toDate = new Date(ny, nm - 1, toDay);
-}
-
-const from  = ymd(fromDate);
-const to    = ymd(toDate);
-const label = `${fromDate.getMonth()+1}/${fromDate.getDate()}〜${toDate.getMonth()+1}/${toDate.getDate()}`;
-return { from, to, label, mode: 'CLOSING' };
+const cp = _calcClosingPeriodForDate(now, anchor);
+return { from: cp.from, to: cp.to, label: cp.label, mode: 'CLOSING' };
 }
 
 // ===== サマリー更新 =====
 function updateSummary() {
 if (typeof DB === 'undefined') return;
 try {
-const period      = getCurrentPeriod();
+const period = getCurrentPeriod();
+_autoRolloverBudgetIfNeeded(period);
+
 const _rawExpTotal = DB.getTotalByRange(period.from, period.to) || 0;
 const _expenseAmt  = isBizMode() ? _getExpenseTotalForRange(period.from, period.to) : 0;
 // 純売上 = raw − 経費エントリ除去 − 経費額控除 = raw − 2*expenseAmt（マイナス許可）
@@ -364,24 +554,19 @@ const expTotal     = isBizMode()
 ? _rawExpTotal - 2 * _expenseAmt
 : _rawExpTotal;
 
-// 固定費: fixed_cost_history ベース（旧 getFixedCostsTotal も fallback）
-const fixedTotal  = S.fixedOn ? (
-typeof DB.getActiveFixedCostHistoryTotal === 'function'
-? (DB.getActiveFixedCostHistoryTotal() || 0)
-: (typeof DB.getFixedCostsTotal === 'function' ? DB.getFixedCostsTotal() || 0 : 0)
-) : 0;
+// 固定費: 対象期間時点で有効な fixed_cost_history を参照
+const fixedTotal = _getPeriodFixedTotal(period);
 
-// 予算: budget_periods ベース（未設定=-1、なければ S.baseBudget にフォールバック）
+// 予算: budget_periods ベース（未設定=-1）
 let baseBudget = -1;
 if (typeof DB.getBudgetForPeriod === 'function') {
 try {
 const budgetInfo = JSON.parse(DB.getBudgetForPeriod(period.from, period.to));
 baseBudget = budgetInfo.totalAmount ?? -1;
 } catch(e) {}
-}
-if (baseBudget < 0) {
-// v31以前のフォールバック
-baseBudget = parseInt(S.baseBudget) || -1;
+} else {
+const parsed = parseInt(S.baseBudget);
+if (!isNaN(parsed) && S.baseBudget !== '') baseBudget = parsed;
 }
 
 const _biz = isBizMode();
@@ -398,8 +583,7 @@ const over   = remain < 0;
 // 期間ラベル
 const periodLabel = document.getElementById('summary-period-label');
 if (periodLabel) {
-const suffix = '';
-periodLabel.innerText = `${period.label}の${_bizLabel('売上', '支出')}${suffix}`;
+periodLabel.innerText = `${period.label}の${_bizLabel('売上', '支出')}`;
 }
 
 // 要素取得（HTMLに全IDが静的に存在する前提）
@@ -462,17 +646,18 @@ if (fixedSubEl) fixedSubEl.style.display = 'flex';
 } else {
 if (fixedSubEl) fixedSubEl.style.display = 'none';
 }
+_renderBmCurrentSummary();
 } catch(e) { console.error('updateSummary:', e); }
 }
 
 function _fillBudgetRow(remainEl, ofEl, barFillEl, remain, effectiveBudget, displayTotal, over) {
-const pct = effectiveBudget > 0
-? Math.min(100, Math.round((displayTotal / effectiveBudget) * 100)) : 100;
+const rawPct = effectiveBudget > 0 ? Math.round((displayTotal / effectiveBudget) * 100) : (displayTotal > 0 ? 100 : 0);
+const pct = Math.max(0, Math.min(100, rawPct));
 const biz = isBizMode();
 // バークラスを先に決定して remainEl の色と同期させる
 const barClass = biz
-? (pct >= 100 ? 'biz-over' : pct >= 85 ? '' : pct >= 60 ? 'warn' : 'over')
-: (pct >= 100 ? 'over'     : pct >= 80 ? 'warn' : '');
+? (rawPct >= 100 ? 'biz-over' : rawPct >= 85 ? '' : rawPct >= 60 ? 'warn' : 'over')
+: (rawPct >= 100 ? 'over'     : rawPct >= 80 ? 'warn' : '');
 // remainEl のカラークラス（バーと同じ基準）
 const remainColorClass = barClass ? (' ' + barClass) : '';
 if (remainEl) {
@@ -509,15 +694,8 @@ try {
 const el = document.getElementById('fixed-total-display');
 if (!el) return;
 if (S.fixedOn) {
-// fixed_cost_history ベース（現在期間の月初時点で有効な固定費の合計）
-const periodFrom = getCurrentPeriod().from;
-let total = 0;
-try {
-const items = JSON.parse(DB.getFixedCostHistoryAt(periodFrom));
-total = items.reduce((s, x) => s + x.amount, 0);
-} catch(e2) {
-total = DB.getFixedCostsTotal() || 0;
-}
+const period = getCurrentPeriod();
+const total = _getPeriodFixedTotal(period);
 el.innerText = `合計 ¥${total.toLocaleString()}`;
 el.style.display = 'inline-flex';
 } else {
@@ -526,10 +704,43 @@ el.style.display = 'none';
 } catch(e) {}
 }
 
+// ===== 設定タブ5「現在期間の予算サマリー」描画 =====
+function _renderBmCurrentSummary() {
+const el = document.getElementById('bm-current-summary');
+if (!el || typeof DB === 'undefined') return;
+try {
+const period = getCurrentPeriod();
+const info = typeof DB.getBudgetForPeriod === 'function'
+? JSON.parse(DB.getBudgetForPeriod(period.from, period.to))
+: { baseAmount: -1, extraTotal: 0, totalAmount: -1 };
+const modeNames = { BM_AUTO: '毎月自動更新', BM_MONTHLY: '毎月手動入力', BM_ONCE: '今期のみ設定' };
+const modeText = modeNames[S.budgetMode] || '毎月自動更新';
+const baseText = info.baseAmount >= 0
+? `¥${info.baseAmount.toLocaleString()}`
+: '<span style="color:#e67e22;">未設定</span>';
+const extraHtml = info.extraTotal > 0
+? ` / 臨時 +¥${info.extraTotal.toLocaleString()}` : '';
+const fixedTotal = _getPeriodFixedTotal(period);
+const fixedHtml = S.fixedOn
+? `<div style="font-size:11px;color:#64748b;margin-top:4px;">固定費（${_escHtml(period.label)}）: ¥${fixedTotal.toLocaleString()}</div>`
+: '';
+el.innerHTML =
+`<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">` +
+`<span style="font-size:12px;font-weight:700;color:#1e293b;">${_escHtml(period.label)} の予算</span>` +
+`<span style="font-size:11px;color:#0984e3;background:#e0f2fe;padding:2px 8px;border-radius:999px;font-weight:600;">${modeText}</span>` +
+`</div>` +
+`<div style="font-size:13px;color:#334155;">${_bizLabel('目標', '基本予算')}: <b>${baseText}</b>${extraHtml}</div>` +
+fixedHtml;
+el.style.display = 'block';
+} catch(e) {
+el.style.display = 'none';
+}
+}
+
 // ===== 入力タブ インフォパネル描画 =====
 function renderInfoPanel() {
 if (typeof DB === 'undefined') return;
-const panel    = document.getElementById('input-info-panel');
+const panel     = document.getElementById('input-info-panel');
 const rankBlock = document.getElementById('info-ranking-block');
 const ptsBlock  = document.getElementById('info-points-block');
 const cmpBlock  = document.getElementById('info-compare-block');
@@ -540,6 +751,7 @@ panel.style.display = anyOn ? 'block' : 'none';
 
 try {
 const period = getCurrentPeriod();
+const biz = isBizMode();
 
 // ─── ランキング（カテゴリ・タグを2カラム表示）───
 if (S.rankingOn && rankBlock) {
@@ -552,10 +764,10 @@ const parts = [rankCat ? 'カテゴリ' : '', rankTag ? 'タグ' : ''].filter(Bo
 const titleEl = document.getElementById('info-ranking-title');
 if (titleEl) titleEl.innerText = `${period.label} ${parts}ランキング TOP3`;
 
-// カテゴリ集計
+// カテゴリ集計（bizMode時は経費タグを除外）
 let catRows = [], tagRows = [];
 if (rankCat) {
-const filter = JSON.stringify({ dateFrom: period.from, dateTo: period.to });
+const filter = JSON.stringify({ dateFrom: period.from, dateTo: period.to, excludeCostTags: biz });
 catRows = JSON.parse(DB.getCategoryStats(filter))
 .filter(r => !S.rankNoZero || r.amount > 0)
 .sort((a,b) => S.rankOrder==='LOW' ? a.amount-b.amount : b.amount-a.amount)
@@ -565,7 +777,7 @@ catRows = JSON.parse(DB.getCategoryStats(filter))
 if (rankTag) {
 const allTags = JSON.parse(DB.getMaster('custom_tags') || '[]');
 for (const tag of allTags) {
-const tf = JSON.stringify({ dateFrom: period.from, dateTo: period.to, tagIds: [tag.id] });
+const tf = JSON.stringify({ dateFrom: period.from, dateTo: period.to, tagIds: [tag.id], excludeCostTags: biz });
 const cs = JSON.parse(DB.getCategoryStats(tf));
 const total = cs.reduce((s,r) => s+r.amount, 0);
 if (!S.rankNoZero || total > 0) tagRows.push({ name: tag.name, amount: total });
@@ -575,7 +787,6 @@ tagRows = tagRows.slice(0, 3);
 }
 
 if (rankCat && rankTag) {
-// 2カラム並列
 const catMax = catRows.length > 0 ? Math.max(...catRows.map(r=>r.amount)) : 1;
 const tagMax = tagRows.length > 0 ? Math.max(...tagRows.map(r=>r.amount)) : 1;
 const catHtml = catRows.map((r,i) => _rankRowHtml2col(r.name, r.amount, catMax, i)).join('') || '<div class="rank-empty">データなし</div>';
@@ -591,7 +802,6 @@ document.getElementById('info-ranking-list').innerHTML = `
 </div>
 </div>`;
 } else {
-// 1カラム
 const rows = rankCat ? catRows : tagRows;
 const maxAmt = rows.length > 0 ? Math.max(...rows.map(r=>r.amount)) : 1;
 document.getElementById('info-ranking-list').innerHTML =
@@ -605,26 +815,19 @@ if (rankBlock) rankBlock.style.display = 'none';
 // ─── ポイント / 経費使用額（bizMode切り替え）───
 if (S.pointsOn && ptsBlock) {
 ptsBlock.style.display = 'block';
-const _ptsBiz = isBizMode();
 
-// タイトル：期間ラベルに合わせて動的変更
 const _ptsTitleEl = document.getElementById('info-pts-block-title');
 if (_ptsTitleEl) {
-if (_ptsBiz) {
-_ptsTitleEl.textContent = (period.label || '今期') + ' 経費使用額';
-} else {
-_ptsTitleEl.textContent = '今期 獲得ポイント';
-}
+_ptsTitleEl.textContent = (period.label || '今期') + (biz ? ' 経費使用額' : ' 獲得ポイント');
 }
 
 try {
 const ptFilter = JSON.stringify({ dateFrom: period.from, dateTo: period.to });
-const ptData   = _ptsBiz
+const ptData   = biz
 ? JSON.parse(DB.getCostTagStats(ptFilter))
 : JSON.parse(DB.getCardPointStats(ptFilter));
 
-if (_ptsBiz) {
-// ─ 経費タグモード ─
+if (biz) {
 const expTags = JSON.parse(DB.getMaster('cost_tags') || '[]');
 const expTagMap = {};
 expTags.forEach(t => { expTagMap[t.id] = t.name; });
@@ -646,13 +849,12 @@ expRows = [...ptData]
 
 document.getElementById('info-points-list').innerHTML = expRows.length > 0
 ? expRows.map(r => `<div class="info-pts-row">
-<span class="info-pts-card">${r.name}</span>
+<span class="info-pts-card">${_escHtml(r.name)}</span>
 <span class="info-pts-val">¥${r.amt.toLocaleString()}</span>
 </div>`).join('')
 : '<div class="rank-empty">経費タグ未登録</div>';
 
 } else {
-// ─ 通常ポイントモード ─
 const allCards = JSON.parse(DB.getMaster('point_cards') || '[]');
 const cardMap  = {};
 allCards.forEach(c => { cardMap[c.id] = c.name; });
@@ -672,7 +874,7 @@ ptRows = [...ptData]
 
 document.getElementById('info-points-list').innerHTML = ptRows.length > 0
 ? ptRows.map(r => `<div class="info-pts-row">
-<span class="info-pts-card">${r.name}</span>
+<span class="info-pts-card">${_escHtml(r.name)}</span>
 <span class="info-pts-val">+${r.pts.toLocaleString()}pt</span>
 </div>`).join('')
 : '<div class="rank-empty">データなし</div>';
@@ -689,44 +891,81 @@ if (ptsBlock) ptsBlock.style.display = 'none';
 if (S.compareOn && cmpBlock) {
 cmpBlock.style.display = 'block';
 
-const pad = n => String(n).padStart(2,'0');
-const ymd = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-// 締日連動ONなら前の締め期間を正確に取得、OFFなら日数ベースで計算
-let prevFromStr, prevToStr;
+let prevPeriod;
 const useClosing = S.closingOn === true || S.closingOn === 'true';
-if (useClosing && period.from) {
-const prev = _calcPrevClosingPeriod(period.from);
-prevFromStr = prev.from;
-prevToStr   = prev.to;
+if (period.mode === 'SEASON') {
+const anchor = parseInt(S.periodStartDay) || 25;
+prevPeriod = _calcSeasonPeriod(new Date(), S.seasonType || 'Q', useClosing, anchor, -1);
+} else if (period.mode === 'YEAR') {
+const py = parseInt(period.from.slice(0, 4)) - 1;
+prevPeriod = { from: `${py}-01-01`, to: `${py}-12-31`, label: `${py}年`, mode: 'YEAR' };
+} else if (useClosing && period.mode === 'CLOSING') {
+const p = _calcPrevClosingPeriod(period.from);
+prevPeriod = { from: p.from, to: p.to, label: p.label, mode: 'CLOSING' };
+} else if (period.mode === 'MONTH') {
+const fd = _parseYmd(period.from);
+let py = fd.getFullYear(), pm = fd.getMonth(); // 1-indexed previous month (0 -> Dec prev year)
+if (pm === 0) { pm = 12; py--; }
+prevPeriod = {
+from: `${py}-${_pad2(pm)}-01`,
+to:   `${py}-${_pad2(pm)}-${_pad2(_lastDayOfMonth(py, pm))}`,
+label: `${pm}月`,
+mode: 'MONTH'
+};
 } else {
-const fromD  = new Date(period.from), toD = new Date(period.to);
+const fromD  = _parseYmd(period.from), toD = _parseYmd(period.to);
 const days   = Math.round((toD - fromD) / 86400000) + 1;
 const prevTo = new Date(fromD); prevTo.setDate(prevTo.getDate() - 1);
 const prevFrom = new Date(prevTo); prevFrom.setDate(prevFrom.getDate() - days + 1);
-prevFromStr = ymd(prevFrom);
-prevToStr   = ymd(prevTo);
+prevPeriod = { from: _ymd(prevFrom), to: _ymd(prevTo), label: '', mode: period.mode };
 }
-const prevFrom = new Date(prevFromStr + 'T00:00:00');
-const prevTo   = new Date(prevToStr   + 'T00:00:00');
+
+const prevFromStr = prevPeriod.from;
+const prevToStr   = prevPeriod.to;
+const prevFrom = _parseYmd(prevFromStr);
+const prevTo   = _parseYmd(prevToStr);
 const prevLabel = `${prevFrom.getMonth()+1}/${prevFrom.getDate()}〜${prevTo.getMonth()+1}/${prevTo.getDate()}`;
 const titleEl = document.getElementById('info-compare-title');
 if (titleEl) titleEl.innerText = `前期間比較（${prevLabel}）`;
 
 const cmpItems = S.cmpTargets.length > 0 ? S.cmpTargets : ['expense'];
-const curTotal  = DB.getTotalByRange(period.from, period.to) || 0;
-const prevTotal = DB.getTotalByRange(prevFromStr, prevToStr) || 0;
+const _curRaw  = DB.getTotalByRange(period.from, period.to) || 0;
+const _prevRaw = DB.getTotalByRange(prevFromStr, prevToStr) || 0;
+const _curExp  = biz ? _getExpenseTotalForRange(period.from, period.to) : 0;
+const _prevExp = biz ? _getExpenseTotalForRange(prevFromStr, prevToStr) : 0;
+const curFixed  = _getPeriodFixedTotal(period);
+const prevFixed = _getPeriodFixedTotal(prevPeriod);
+
+let curTotal  = biz ? (_curRaw - 2 * _curExp) : _curRaw;
+let prevTotal = biz ? (_prevRaw - 2 * _prevExp) : _prevRaw;
+if (S.fixedOn && S.fixedMode === 'ADD') {
+curTotal  = biz ? (curTotal - curFixed) : (curTotal + curFixed);
+prevTotal = biz ? (prevTotal - prevFixed) : (prevTotal + prevFixed);
+}
+
 let html = '';
 
 // 支出額・残予算は通常行
 if (cmpItems.includes('expense')) {
-html += _cmpRowHtml(isBizMode() ? '売上合計' : '支出合計', curTotal, prevTotal);
+html += _cmpRowHtml(biz ? '純売上' : '支出合計', curTotal, prevTotal, biz);
 }
 if (cmpItems.includes('remain')) {
-const base = parseInt(S.baseBudget) || 0;
-if (base > 0) {
-const fixedAmt = (S.fixedOn && S.fixedMode === 'BUDGET') ? (DB.getFixedCostsTotal() || 0) : 0;
-const effBudget = Math.max(0, base - fixedAmt);
-html += _cmpRowHtml(isBizMode() ? '目標差額' : '残予算', effBudget - curTotal, effBudget - prevTotal);
+let curBase = -1, prevBase = -1;
+try {
+const ci = JSON.parse(DB.getBudgetForPeriod(period.from, period.to));
+curBase = ci.totalAmount ?? -1;
+const pi = JSON.parse(DB.getBudgetForPeriod(prevFromStr, prevToStr));
+prevBase = pi.totalAmount ?? -1;
+} catch(e) {}
+if (curBase >= 0) {
+const curEff  = (S.fixedOn && S.fixedMode === 'BUDGET')
+? (biz ? Math.max(0, curBase + curFixed) : Math.max(0, curBase - curFixed)) : curBase;
+const prevBaseResolved = prevBase >= 0 ? prevBase : curBase;
+const prevEff = (S.fixedOn && S.fixedMode === 'BUDGET')
+? (biz ? Math.max(0, prevBaseResolved + prevFixed) : Math.max(0, prevBaseResolved - prevFixed)) : prevBaseResolved;
+const curRem  = biz ? (curTotal - curEff) : (curEff - curTotal);
+const prevRem = biz ? (prevTotal - prevEff) : (prevEff - prevTotal);
+html += _cmpRowHtml(biz ? '目標差額' : '残予算', curRem, prevRem, true);
 }
 }
 
@@ -735,22 +974,21 @@ const hasCat = cmpItems.includes('category');
 const hasTag = cmpItems.includes('tag');
 
 if (hasCat && hasTag) {
-// 2カラム並列
-const curCats  = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: period.from, dateTo: period.to })));
-const prevCats = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: prevFromStr, dateTo: prevToStr })));
+const curCats  = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: period.from, dateTo: period.to, excludeCostTags: biz })));
+const prevCats = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: prevFromStr, dateTo: prevToStr, excludeCostTags: biz })));
 const prevCatMap = {}; prevCats.forEach(r => { prevCatMap[r.catName] = r.amount; });
 const catCmpHtml = curCats.filter(r=>r.amount>0).slice(0,3)
-.map(r => _cmpRowHtml2col(r.catName, r.amount, prevCatMap[r.catName]||0)).join('') || '<div class="rank-empty">データなし</div>';
+.map(r => _cmpRowHtml2col(r.catName, r.amount, prevCatMap[r.catName]||0, biz)).join('') || '<div class="rank-empty">データなし</div>';
 
 const allTags = JSON.parse(DB.getMaster('custom_tags') || '[]');
 const tagCmpRows = [];
 for (const tag of allTags) {
-const curA  = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: period.from, dateTo: period.to, tagIds: [tag.id] }))).reduce((s,r)=>s+r.amount,0);
-const prevA = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: prevFromStr, dateTo: prevToStr, tagIds: [tag.id] }))).reduce((s,r)=>s+r.amount,0);
+const curA  = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: period.from, dateTo: period.to, tagIds: [tag.id], excludeCostTags: biz }))).reduce((s,r)=>s+r.amount,0);
+const prevA = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: prevFromStr, dateTo: prevToStr, tagIds: [tag.id], excludeCostTags: biz }))).reduce((s,r)=>s+r.amount,0);
 if (curA > 0 || prevA > 0) tagCmpRows.push({ name: tag.name, cur: curA, prev: prevA });
 }
 tagCmpRows.sort((a,b)=>b.cur-a.cur);
-const tagCmpHtml = tagCmpRows.slice(0,3).map(r => _cmpRowHtml2col(r.name, r.cur, r.prev)).join('') || '<div class="rank-empty">データなし</div>';
+const tagCmpHtml = tagCmpRows.slice(0,3).map(r => _cmpRowHtml2col(r.name, r.cur, r.prev, biz)).join('') || '<div class="rank-empty">データなし</div>';
 
 html += `<div class="info-2col" style="margin-top:6px;">
 <div class="info-2col-block">
@@ -762,16 +1000,16 @@ html += `<div class="info-2col" style="margin-top:6px;">
 </div>
 </div>`;
 } else if (hasCat) {
-const curCats  = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: period.from, dateTo: period.to })));
-const prevCats = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: prevFromStr, dateTo: prevToStr })));
+const curCats  = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: period.from, dateTo: period.to, excludeCostTags: biz })));
+const prevCats = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: prevFromStr, dateTo: prevToStr, excludeCostTags: biz })));
 const prevCatMap = {}; prevCats.forEach(r => { prevCatMap[r.catName] = r.amount; });
-html += curCats.filter(r=>r.amount>0).slice(0,3).map(r => _cmpRowHtml(r.catName, r.amount, prevCatMap[r.catName]||0)).join('');
+html += curCats.filter(r=>r.amount>0).slice(0,3).map(r => _cmpRowHtml(r.catName, r.amount, prevCatMap[r.catName]||0, biz)).join('');
 } else if (hasTag) {
 const allTags = JSON.parse(DB.getMaster('custom_tags') || '[]');
 for (const tag of allTags) {
-const curA  = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: period.from, dateTo: period.to, tagIds: [tag.id] }))).reduce((s,r)=>s+r.amount,0);
-const prevA = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: prevFromStr, dateTo: prevToStr, tagIds: [tag.id] }))).reduce((s,r)=>s+r.amount,0);
-if (curA > 0 || prevA > 0) html += _cmpRowHtml(tag.name, curA, prevA);
+const curA  = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: period.from, dateTo: period.to, tagIds: [tag.id], excludeCostTags: biz }))).reduce((s,r)=>s+r.amount,0);
+const prevA = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: prevFromStr, dateTo: prevToStr, tagIds: [tag.id], excludeCostTags: biz }))).reduce((s,r)=>s+r.amount,0);
+if (curA > 0 || prevA > 0) html += _cmpRowHtml(tag.name, curA, prevA, biz);
 }
 }
 
@@ -789,7 +1027,7 @@ const medal = ['🥇','🥈','🥉'][i] || `${i+1}.`;
 return `<div class="info-rank-row">
 <span class="info-rank-medal">${medal}</span>
 <div class="info-rank-info">
-<span class="info-rank-name">${name}</span>
+<span class="info-rank-name">${_escHtml(name)}</span>
 <div class="rank-bar-wrap"><div class="rank-bar-fill" style="width:${pct}%"></div></div>
 </div>
 <span class="info-rank-amt">¥${amount.toLocaleString()}</span>
@@ -801,34 +1039,35 @@ function _rankRowHtml2col(name, amount, maxAmt, i) {
 const medal = ['🥇','🥈','🥉'][i] || `${i+1}.`;
 return `<div class="info-rank-row-sm">
 <span class="info-rank-medal-sm">${medal}</span>
-<span class="info-rank-name-sm">${name}</span>
+<span class="info-rank-name-sm">${_escHtml(name)}</span>
 <span class="info-rank-amt-sm">¥${amount.toLocaleString()}</span>
 </div>`;
 }
 
 // 比較行（1カラム用）
-function _cmpRowHtml(label, curVal, prevVal) {
+function _cmpRowHtml(label, curVal, prevVal, higherIsBetter = false) {
 const diff = curVal - prevVal;
 const pct  = prevVal !== 0 ? Math.round((diff / Math.abs(prevVal)) * 100) : 0;
-const sign = diff >= 0 ? '+' : '';
-const cls  = diff > 0 ? 'cmp-up' : diff < 0 ? 'cmp-down' : '';
-const diffStr = S.cmpPercent ? `${sign}${pct}%` : `${sign}¥${Math.abs(diff).toLocaleString()}`;
+const sign = diff > 0 ? '+' : diff < 0 ? '−' : '';
+const cls  = diff === 0 ? '' : (higherIsBetter ? (diff > 0 ? 'cmp-down' : 'cmp-up') : (diff > 0 ? 'cmp-up' : 'cmp-down'));
+const diffStr = S.cmpPercent ? `${sign}${Math.abs(pct)}%` : `${sign}¥${Math.abs(diff).toLocaleString()}`;
+const valStr = curVal < 0 ? `−¥${Math.abs(curVal).toLocaleString()}` : `¥${curVal.toLocaleString()}`;
 return `<div class="info-cmp-row">
-<span class="info-cmp-label">${label}</span>
-<span class="info-cmp-val">¥${curVal.toLocaleString()}</span>
+<span class="info-cmp-label">${_escHtml(label)}</span>
+<span class="info-cmp-val">${valStr}</span>
 <span class="info-cmp-diff ${cls}">${diffStr}</span>
 </div>`;
 }
 
 // 比較行（2カラム用・コンパクト）
-function _cmpRowHtml2col(name, curVal, prevVal) {
+function _cmpRowHtml2col(name, curVal, prevVal, higherIsBetter = false) {
 const diff = curVal - prevVal;
 const pct  = prevVal !== 0 ? Math.round((diff / Math.abs(prevVal)) * 100) : 0;
-const sign = diff >= 0 ? '+' : '';
-const cls  = diff > 0 ? 'cmp-up' : diff < 0 ? 'cmp-down' : '';
-const diffStr = S.cmpPercent ? `${sign}${pct}%` : `${sign}¥${Math.abs(diff).toLocaleString()}`;
+const sign = diff > 0 ? '+' : diff < 0 ? '−' : '';
+const cls  = diff === 0 ? '' : (higherIsBetter ? (diff > 0 ? 'cmp-down' : 'cmp-up') : (diff > 0 ? 'cmp-up' : 'cmp-down'));
+const diffStr = S.cmpPercent ? `${sign}${Math.abs(pct)}%` : `${sign}¥${Math.abs(diff).toLocaleString()}`;
 return `<div class="info-cmp-row-sm">
-<span class="info-cmp-label-sm">${name}</span>
+<span class="info-cmp-label-sm">${_escHtml(name)}</span>
 <span class="info-cmp-diff-sm ${cls}">${diffStr}</span>
 </div>`;
 }
@@ -842,16 +1081,16 @@ if (typeof DB === "undefined") return;
 try {
 const cats = JSON.parse(DB.getMaster('categories') || "[]");
 document.getElementById('categoryGrid').innerHTML = cats.map(c =>
-`<div class="tile ${selCId===c.id?'selected':''}" onclick="vibe();selCId=${c.id};refresh()">${c.name}</div>`
+`<div class="tile ${selCId===c.id?'selected':''}" onclick="vibe();selCId=${c.id};refresh()">${_escHtml(c.name)}</div>`
 ).join('');
 const tags = JSON.parse(DB.getMaster('custom_tags') || "[]");
 document.getElementById('tagArea').innerHTML = tags.map(t =>
-`<div class="tag ${selTIds.has(t.id)?'selected':''}" onclick="vibe();toggleTag(${t.id})">${t.name}</div>`
+`<div class="tag ${selTIds.has(t.id)?'selected':''}" onclick="vibe();toggleTag(${t.id})">${_escHtml(t.name)}</div>`
 ).join('');
 const _cardTable = isBizMode() ? 'cost_tags' : 'point_cards';
 const cards = JSON.parse(DB.getMaster(_cardTable) || "[]");
 document.getElementById('cardArea').innerHTML = cards.map(c =>
-`<div class="tag ${selCardId===c.id?'selected':''}" onclick="vibe();selCardId=${c.id};refresh()">${c.name}</div>`
+`<div class="tag ${selCardId===c.id?'selected':''}" onclick="vibe();selCardId=${c.id};refresh()">${_escHtml(c.name)}</div>`
 ).join('');
 } catch (e) { console.error(e); }
 }
@@ -914,12 +1153,13 @@ S.displayMode   = db.displayMode   || d.displayMode;
 S.periodUnit    = db.periodUnit    || d.periodUnit;
 S.seasonType    = db.seasonType    || d.seasonType;
 S.simpleView    = db.simpleView === 'REM' ? 'REMAIN' : (db.simpleView || d.simpleView);
-S.pointsOn      = db.pointsOn  !== undefined ? db.pointsOn  !== 'false' : d.pointsOn;
+S.pointsOn      = (db.pointsOn !== undefined && db.pointsOn !== '') ? db.pointsOn !== 'false' : d.pointsOn;
 S.pointsMode    = db.pointsMode    || d.pointsMode;
 S.pointsCards   = db.pointsCards ? db.pointsCards.split(',').map(Number).filter(Boolean) : [];
 S.fixedOn       = db.fixedOn   === 'true';
 S.fixedMode     = db.fixedMode     || d.fixedMode;
-S.closingOn      = db.closingOn !== undefined ? db.closingOn !== 'false' : d.closingOn;
+S.closingOn     = (db.closingOn !== undefined && db.closingOn !== '') ? db.closingOn === 'true' : d.closingOn;
+S._bmLastChecked = db.bmLastChecked || '';
 // 後方互換移行：旧 closingDay/payday/budgetLink → periodStartDay に統合
 if (db.periodStartDay) {
 S.periodStartDay = db.periodStartDay;
@@ -1023,6 +1263,7 @@ _applyBizModeUI();
 // 設定反映後にUI更新
 try { updateSummary(); }          catch(e) { console.error('updateSummary in apply:', e); }
 try { updateFixedTotalBadge(); }  catch(e) {}
+try { _renderBmCurrentSummary(); } catch(e) {}
 try { renderInfoPanel(); }        catch(e) { console.error('renderInfoPanel in apply:', e); }
 }
 
@@ -1176,7 +1417,7 @@ try {
 const _table = isBizMode() ? 'cost_tags' : 'point_cards';
 const cards = JSON.parse(DB.getMaster(_table) || "[]");
 document.getElementById('pts-card-area').innerHTML = cards.map(c =>
-`<div class="tag sel-btn ${S.pointsCards.includes(c.id)?'selected':''}" onclick="vibe();togglePointsCard(${c.id})">${c.name}</div>`
+`<div class="tag sel-btn ${S.pointsCards.includes(c.id)?'selected':''}" onclick="vibe();togglePointsCard(${c.id})">${_escHtml(c.name)}</div>`
 ).join('');
 } catch(e) { console.error(e); }
 }
@@ -1237,24 +1478,11 @@ function _updatePeriodPreview() {
 const el = document.getElementById('period-preview');
 if (!el) return;
 if (!S.closingOn) { el.style.display = 'none'; return; }
-const anchor  = parseInt(S.periodStartDay) || 25;
-const pad     = n => String(n).padStart(2, '0');
-const lastDay = (y, m) => new Date(y, m, 0).getDate();
-const now     = new Date();
-const cy = now.getFullYear(), cm = now.getMonth() + 1;
-const anchorThisMonth = Math.min(anchor, lastDay(cy, cm));
-let startY = cy, startM = cm;
-if (now.getDate() <= anchorThisMonth) {
-startM--; if (startM < 1) { startM = 12; startY--; }
-}
-const endM    = startM === 12 ? 1 : startM + 1;
-const endY    = startM === 12 ? startY + 1 : startY;
-const fromDay = Math.min(anchor + 1, lastDay(startY, startM));
-const toDay   = Math.min(anchor,     lastDay(endY, endM));
+const anchor = parseInt(S.periodStartDay) || 25;
+const cp = _calcClosingPeriodForDate(new Date(), anchor);
 el.innerHTML =
 '毎月 <strong>' + anchor + '日の翌日</strong> 〜 翌月 <strong>' + anchor + '日</strong> が1期間<br>' +
-'<span style="color:#64748b;">（例: ' + startY + '/' + pad(startM) + '/' + pad(fromDay) +
-' 〜 ' + endY + '/' + pad(endM) + '/' + pad(toDay) + '）</span>';
+'<span style="color:#64748b;">（例: ' + cp.from.replace(/-/g, '/') + ' 〜 ' + cp.to.replace(/-/g, '/') + '）</span>';
 el.style.display = 'block';
 }
 
@@ -1405,6 +1633,7 @@ if (!el) return;
 S.bizMode = el.value === 'true';
 markSettingsDirty();
 _applyBizModeUI();
+refresh();
 try { updateSummary(); } catch(e) {}
 try { renderInfoPanel(); } catch(e) {}
 if (document.getElementById('view-analytics')?.style.display !== 'none') renderAnalytics();
@@ -1420,6 +1649,7 @@ if (id === 'base-budget')      { S.baseBudget   = el.value; }
 markSettingsDirty();
 // 即時反映
 try { updateSummary(); }     catch(e) {}
+try { updateFixedTotalBadge(); } catch(e) {}
 try { renderInfoPanel(); }   catch(e) {}
 }
 
@@ -1432,6 +1662,8 @@ if (mb) mb.style.display = '';
 }
 
 function showModal(title, body, isPrompt, callback) {
+const mb = document.querySelector('.modal-btns');
+if (mb) mb.style.display = '';
 document.getElementById('modal-title').innerText = title;
 document.getElementById('modal-body').innerHTML = body + (isPrompt
 ? '<input type="text" id="m-input" style="width:100%;margin-top:10px;padding:12px;box-sizing:border-box;border:1px solid #ccc;border-radius:8px;">'
@@ -1449,12 +1681,11 @@ if (callback) callback(v);
 
 function openMasterEdit(table) {
 if (table === 'fixed_costs') { openFixedCostsEdit(); return; }
-// expense_tags はAndroid DBに存在しない可能性があるためtry-catchで保護
 let data = [];
 try { data = JSON.parse(DB.getMaster(table) || '[]'); } catch(e) { data = []; }
 let h = `<div style="max-height:300px;overflow-y:auto">` + data.map(item => `
 <div style="display:flex;gap:5px;margin-bottom:10px;align-items:center;">
-<input type="text" value="${item.name}" id="m-${item.id}" style="flex:1;padding:8px;font-size:14px;">
+<input type="text" value="${_escHtml(item.name)}" id="m-${item.id}" style="flex:1;padding:8px;font-size:14px;">
 <button onclick="vibe();handleMasterUpdate('${table}',${item.id})" style="background:var(--primary);color:white;border:none;padding:8px;border-radius:6px;">更</button>
 <button onclick="vibe();handleMasterDelete('${table}',${item.id})" style="background:var(--danger);color:white;border:none;padding:8px;border-radius:6px;">消</button>
 </div>`).join('') +
@@ -1472,7 +1703,7 @@ if (data.length === 0) h += `<div style="color:var(--text-sub);text-align:center
 h += data.map(item => `
 <div style="margin-bottom:10px;padding:10px;background:#f8f9fa;border-radius:8px;">
 <div style="display:flex;gap:5px;margin-bottom:6px;align-items:center;">
-<input type="text" value="${item.name}" id="fc-name-${item.id}" placeholder="名称" style="flex:1;padding:7px;font-size:13px;border:1px solid #ddd;border-radius:6px;">
+<input type="text" value="${_escHtml(item.name)}" id="fc-name-${item.id}" placeholder="名称" style="flex:1;padding:7px;font-size:13px;border:1px solid #ddd;border-radius:6px;">
 <button onclick="vibe();handleFixedCostDelete(${item.id})" style="background:var(--danger);color:white;border:none;padding:8px;border-radius:6px;font-size:12px;">削除</button>
 </div>
 <div style="display:flex;gap:5px;align-items:center;">
@@ -1534,6 +1765,7 @@ created_at: originalCreatedAt
 const _sdDate = payload.date ? payload.date.slice(0, 7) : '';
 _checkStartMonthGuard(_sdDate, () => {
 if (DB.save(JSON.stringify(payload))) {
+_clearEarliestDateCache();
 // 初回支出検知: appStartMonth 未設定かつ保存後の月次データが1件のみ
 let _isFirstEntry = false;
 if (!S.appStartMonth && payload.date) {
@@ -1576,8 +1808,14 @@ document.getElementById('amount').value = "";
 document.getElementById('itemName').value = "";
 document.getElementById('points').value = "";
 selCId=null; selTIds.clear(); selCardId=null; isCard=false; editId=-1; originalCreatedAt="";
-document.getElementById('cardBtn').classList.remove('on');
+const cardBtn = document.getElementById('cardBtn');
+if (cardBtn) {
+cardBtn.classList.remove('on');
+cardBtn.textContent = isBizMode() ? '経費' : 'CARD';
+}
 document.getElementById('pointSection').style.display = 'none';
+const _ptsWrap = document.getElementById('points-input-wrap');
+if (_ptsWrap) _ptsWrap.style.display = 'none';
 document.getElementById('save-btn').innerText = "保存";
 isMemoOpen=false;
 document.getElementById('memoArea').style.display = 'none';
@@ -1591,19 +1829,20 @@ function nav(m) {
 if (m !== 'settings') {
 let hasBudget = false;
 try {
-if (typeof DB !== 'undefined' && typeof DB.getBudgetForPeriod === 'function') {
 const period = getCurrentPeriod();
+_autoRolloverBudgetIfNeeded(period);
+if (typeof DB !== 'undefined' && typeof DB.getBudgetForPeriod === 'function') {
 const info   = JSON.parse(DB.getBudgetForPeriod(period.from, period.to));
 hasBudget    = info.totalAmount >= 0;
 } else {
-hasBudget = (parseInt(S.baseBudget) || 0) > 0;
+hasBudget = (parseInt(S.baseBudget) || 0) >= 0 && S.baseBudget !== '';
 }
 } catch(e) {}
 if (S.simpleView !== 'EXP' && !hasBudget) {
 showModal(
 '⚠️ 基本月予算が未設定です',
 '現在の表示設定には予算額が必要です。<br><br>' +
-'設定4「基本月予算」に金額を入力するか、<br>' +
+'設定5「予算・固定費の管理」で予算を設定するか、<br>' +
 '設定2「表示内容」を「支出額のみ」に変更してください。',
 false,
 () => { nav('settings'); }
@@ -1664,8 +1903,11 @@ updateFab();
 }
 
 // ===== 履歴読み込み =====
+let _histRecordMap = {};
+
 function loadMore() {
 try {
+if (currentOffset === 0) _histRecordMap = {};
 let dataRaw;
 if (searchMode) {
 // 検索フィルタを使用
@@ -1696,32 +1938,36 @@ document.getElementById('displayArea').innerHTML = "<p style='color:red;padding:
 function buildHistItem(d) {
 const item = mode==='SAVE' ? d : d.original;
 if (!item) return "";
+if (mode === 'SAVE') _histRecordMap[d.id] = d;
 
-const dateDisplay = (item.date || "2026-01-01").replace(/-/g, '/');
+const dateDisplay = _escHtml((item.date || "2026-01-01").replace(/-/g, '/'));
 const tsRaw = item.created_at || '';
 const tsDisplay = formatCreatedAt(tsRaw);
-const tsHtml = tsDisplay ? `<span class="hist-ts">登録 ${tsDisplay}</span>` : '';
+const tsHtml = tsDisplay ? `<span class="hist-ts">登録 ${_escHtml(tsDisplay)}</span>` : '';
 
 // カテゴリ名
-const catName = d.category || '未分類';
+const catName = _escHtml(d.category || '未分類');
 
 // タグ：カンマ区切りのタグ名文字列
 const tagsHtml = d.tags
-? d.tags.split(',').filter(t => t.trim()).map(t => `<span class="hist-tag-inline">#${t.trim()}</span>`).join('')
+? d.tags.split(',').filter(t => t.trim()).map(t => `<span class="hist-tag-inline">#${_escHtml(t.trim())}</span>`).join('')
 : '';
 
-// カード・ポイント（支出額の下）
+// カード・ポイント / 経費タグ（支出額の下）
+const isCostTag = Number(d.is_cost_tag) === 1 || Number(item.card_id) >= 10000;
 const cardHtml = (item.card_id > 0)
-? `<span class="hist-card">💳 ${d.card || 'カード'} +${item.points || 0}pt</span>`
+? (isCostTag
+? `<span class="hist-card">🏷️ ${_escHtml(d.card || '経費')}</span>`
+: `<span class="hist-card">💳 ${_escHtml(d.card || 'カード')} +${item.points || 0}pt</span>`)
 : '';
 
 // 備考（入力がある場合のみ）
 const memoHtml = item.name
-? `<div class="hist-memo">📝 ${item.name}</div>`
+? `<div class="hist-memo">📝 ${_escHtml(item.name)}</div>`
 : '';
 
 const clickHandler = mode==='SAVE'
-? `vibe();editRequest(${JSON.stringify(d).replace(/"/g,'&quot;')})`
+? `vibe();editRequestById(${Number(d.id)})`
 : '';
 
 return `
@@ -1796,9 +2042,15 @@ showModal("確認", `${ids.length}件を${label}しますか？`, false, (r) => 
 if (r) {
 if (mode==='SAVE') ids.forEach(id => DB.deleteLog(id));
 else DB.restoreLogs(JSON.stringify(ids));
+_clearEarliestDateCache();
 selItems.clear(); doSubTab(mode); updateSummary();
 }
 });
+}
+
+function editRequestById(id) {
+const item = _histRecordMap[id];
+if (item) editRequest(item);
 }
 
 function editRequest(item) {
@@ -1814,13 +2066,23 @@ if (item.name) {
 isMemoOpen=true;
 document.getElementById('memoArea').style.display='block';
 document.getElementById('memoToggleBtn').innerText='メモ ×';
+} else {
+isMemoOpen=false;
+document.getElementById('memoArea').style.display='none';
+document.getElementById('memoToggleBtn').innerText='メモ ＋';
 }
 selCId=parseInt(item.category_id);
 selTIds=new Set(item.tag_ids ? item.tag_ids.split(',').filter(x=>x).map(Number) : []);
 isCard=(item.card_id>0); selCardId=isCard ? parseInt(item.card_id) : null;
 document.getElementById('points').value = item.points || "";
-document.getElementById('cardBtn').classList.toggle('on', isCard);
+const cardBtn = document.getElementById('cardBtn');
+if (cardBtn) {
+cardBtn.classList.toggle('on', isCard);
+cardBtn.textContent = isBizMode() ? '経費' : 'CARD';
+}
 document.getElementById('pointSection').style.display = isCard ? 'block' : 'none';
+const _ptsWrap = document.getElementById('points-input-wrap');
+if (_ptsWrap) _ptsWrap.style.display = (isCard && !isBizMode()) ? 'block' : 'none';
 doNav('input');
 document.getElementById('save-btn').innerText = "更新/復元";
 refresh();
@@ -1873,19 +2135,20 @@ if (typeof DB === 'undefined') return;
 try {
 const cats  = JSON.parse(DB.getMaster('categories')  || '[]');
 const tags  = JSON.parse(DB.getMaster('custom_tags') || '[]');
-const cards = JSON.parse(DB.getMaster('point_cards') || '[]');
+const cardTable = isBizMode() ? 'cost_tags' : 'point_cards';
+const cards = JSON.parse(DB.getMaster(cardTable) || '[]');
 
 document.getElementById('srch-cat-area').innerHTML = cats.map(c =>
 `<div class="srch-chip ${searchFilter.categoryIds.includes(c.id)?'selected':''}"
-onclick="vibe();toggleSrchId('categoryIds',${c.id},this)">${c.name}</div>`
+onclick="vibe();toggleSrchId('categoryIds',${c.id},this)">${_escHtml(c.name)}</div>`
 ).join('');
 document.getElementById('srch-tag-area').innerHTML = tags.map(t =>
 `<div class="srch-chip ${searchFilter.tagIds.includes(t.id)?'selected':''}"
-onclick="vibe();toggleSrchId('tagIds',${t.id},this)">${t.name}</div>`
+onclick="vibe();toggleSrchId('tagIds',${t.id},this)">${_escHtml(t.name)}</div>`
 ).join('');
 document.getElementById('srch-card-area').innerHTML = cards.map(c =>
 `<div class="srch-chip ${searchFilter.cardIds.includes(c.id)?'selected':''}"
-onclick="vibe();toggleSrchId('cardIds',${c.id},this)">${c.name}</div>`
+onclick="vibe();toggleSrchId('cardIds',${c.id},this)">${_escHtml(c.name)}</div>`
 ).join('');
 } catch(e) { console.error(e); }
 
@@ -2060,6 +2323,10 @@ _bmRender();
 function closeBudgetManagerModal() {
 document.getElementById('bm-modal')?.remove();
 updateSummary();
+updateFixedTotalBadge();
+_renderBmCurrentSummary();
+renderInfoPanel();
+if (document.getElementById('view-analytics')?.style.display === 'block') renderAnalytics();
 }
 
 function _bmShowSub(html) {
@@ -2076,14 +2343,17 @@ if (sub) { sub.style.display = 'none'; sub.innerHTML = ''; }
 function _bmRender() {
 const labelEl = document.getElementById('bm-period-label');
 if (labelEl) {
-const fd = new Date(_bmPeriodFrom + 'T00:00:00'), td = new Date(_bmPeriodTo + 'T00:00:00');
+const fd = _parseYmd(_bmPeriodFrom), td = _parseYmd(_bmPeriodTo);
 const fmt = d => `${d.getMonth()+1}/${d.getDate()}`;
-labelEl.innerText = `${_bmPeriodFrom.slice(0,4)}年 ${fmt(fd)}〜${fmt(td)}`;
+labelEl.innerText = fd.getFullYear() === td.getFullYear()
+? `${fd.getFullYear()}年 ${fmt(fd)}〜${fmt(td)}`
+: `${fd.getFullYear()}/${fmt(fd)}〜${td.getFullYear()}/${fmt(td)}`;
 }
 let budgetInfo = { baseAmount: -1, extras: [], extraTotal: 0, totalAmount: -1 };
 try { budgetInfo = JSON.parse(DB.getBudgetForPeriod(_bmPeriodFrom, _bmPeriodTo)); } catch(e) {}
+const fixedLookup = _getFixedLookupDate(_bmPeriodFrom, _bmPeriodTo, !!S.closingOn);
 let fixedItems = [];
-try { fixedItems = JSON.parse(DB.getFixedCostHistoryAt(_bmPeriodFrom)); } catch(e) {}
+try { fixedItems = JSON.parse(DB.getFixedCostHistoryAt(fixedLookup)); } catch(e) {}
 const fixedTotal = fixedItems.reduce((s, x) => s + x.amount, 0);
 const extras  = budgetInfo.extras || [];
 const baseAmt = budgetInfo.baseAmount;
@@ -2092,9 +2362,9 @@ const content = document.getElementById('bm-content');
 if (!content) return;
 
 const modeOpts = [
-['BM_AUTO',    '毎月自動更新',  '設定額を毎月継続'],
+['BM_AUTO',    '毎月自動更新',  '設定額を毎期間継続'],
 ['BM_MONTHLY', '毎月手動入力',  '期間開始時に予算管理画面を表示'],
-['BM_ONCE',    '今月のみ設定',  '翌月は未設定（手動入力を促す）'],
+['BM_ONCE',    '今期のみ設定',  '次期は未設定（手動入力を促す）'],
 ].map(([val, label, desc]) =>
 `<label class="bm-mode-opt${curMode===val?' active':''}" onclick="vibe();bmSetMode('${val}')"><div class="bm-mode-radio${curMode===val?' on':''}"></div><div><div style="font-size:13px;font-weight:600;color:#1e293b;">${label}</div><div style="font-size:11px;color:#64748b;">${desc}</div></div></label>`
 ).join('');
@@ -2102,18 +2372,18 @@ const modeOpts = [
 const extraRows = extras.length === 0
 ? '<div style="font-size:12px;color:#94a3b8;padding:6px 0;">臨時収入はありません</div>'
 : extras.map(e =>
-`<div class="bm-item"><div class="bm-item-name">${e.name}</div><div class="bm-item-amount">+¥ ${e.amount.toLocaleString()}</div><button onclick="vibe();bmEditExtra(${e.id},'${_escQ(e.name)}',${e.amount})" class="bm-item-edit">編集</button><button onclick="vibe();bmDeleteExtra(${e.id})" class="bm-item-del">削除</button></div>`
+`<div class="bm-item"><div class="bm-item-name">${_escHtml(e.name)}</div><div class="bm-item-amount">+¥ ${e.amount.toLocaleString()}</div><button onclick="vibe();bmEditExtra(${e.id},'${_escJsAttr(e.name)}',${e.amount})" class="bm-item-edit">編集</button><button onclick="vibe();bmDeleteExtra(${e.id})" class="bm-item-del">削除</button></div>`
 ).join('');
 
 const fixedRows = fixedItems.length === 0
 ? '<div style="font-size:12px;color:#94a3b8;padding:6px 0;">固定費はありません</div>'
 : fixedItems.map(f =>
-`<div class="bm-item"><div class="bm-item-name">${f.name}</div><div class="bm-item-amount">¥ ${f.amount.toLocaleString()}</div><button onclick="vibe();bmEditFixed(${f.id},'${_escQ(f.name)}',${f.amount},'${f.validFrom}')" class="bm-item-edit">編集</button><button onclick="vibe();bmDeleteFixed(${f.id},'${_escQ(f.name)}')" class="bm-item-del">削除</button></div>`
+`<div class="bm-item"><div class="bm-item-name">${_escHtml(f.name)}</div><div class="bm-item-amount">¥ ${f.amount.toLocaleString()}</div><button onclick="vibe();bmEditFixed(${f.id},'${_escJsAttr(f.name)}',${f.amount},'${_escJsAttr(f.validFrom)}')" class="bm-item-edit">編集</button><button onclick="vibe();bmDeleteFixed(${f.id},'${_escJsAttr(f.name)}')" class="bm-item-del">削除</button></div>`
 ).join('');
 
 content.innerHTML =
 `<div class="bm-section"><div class="bm-section-title">予算の更新方法</div><div style="display:flex;flex-direction:column;gap:6px;">${modeOpts}</div></div>` +
-`<div class="bm-section"><div class="bm-section-title">基本月予算</div><div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;"><input type="number" id="bm-base-input" placeholder="0" value="${baseAmt >= 0 ? baseAmt : ''}" style="flex:1;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;font-size:16px;font-weight:600;"><span style="font-size:13px;color:#64748b;">円</span><button onclick="vibe();bmSaveBase()" class="bm-btn-primary">保存</button></div>${baseAmt < 0 ? '<div style="font-size:11px;color:#e67e22;margin-top:2px;">⚠️ この期間の予算が未設定です</div>' : ''}</div>` +
+`<div class="bm-section"><div class="bm-section-title">基本予算</div><div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;"><input type="number" id="bm-base-input" placeholder="0" value="${baseAmt >= 0 ? baseAmt : ''}" style="flex:1;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;font-size:16px;font-weight:600;"><span style="font-size:13px;color:#64748b;">円</span><button onclick="vibe();bmSaveBase()" class="bm-btn-primary">保存</button></div>${baseAmt < 0 ? '<div style="font-size:11px;color:#e67e22;margin-top:2px;">⚠️ この期間の予算が未設定です</div>' : ''}</div>` +
 (() => {
 const _bmBiz = isBizMode();
 const _extraGray = _bmBiz ? 'opacity:0.38;pointer-events:none;user-select:none;' : '';
@@ -2123,38 +2393,38 @@ return `<div class="bm-section" style="${_extraGray}"><div class="bm-section-tit
 `<div class="bm-section"><div class="bm-section-title" style="display:flex;justify-content:space-between;align-items:center;"><span>固定費・定期支出</span><button onclick="vibe();bmAddFixed()" class="bm-btn-add">＋ 追加</button></div><div id="bm-fixed-list">${fixedRows}</div><div class="bm-total-row bm-total-grand"><span>固定費合計</span><span>¥ ${fixedTotal.toLocaleString()}</span></div></div>`;
 }
 
-function _escQ(s) { return String(s).replace(/'/g, "\\'"); }
+function _escQ(s) { return String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
+function _escJsAttr(s) { return _escHtml(_escQ(s)); }
 
 function bmPrevPeriod() { _bmMovePeriod(-1); }
 function bmNextPeriod() { _bmMovePeriod(+1); }
 
 function _bmMovePeriod(dir) {
-const pad = n => String(n).padStart(2,'0');
-const lastDay = (y,m) => new Date(y,m,0).getDate();
-const from = new Date(_bmPeriodFrom + 'T00:00:00');
-const to   = new Date(_bmPeriodTo   + 'T00:00:00');
-const spanDays = Math.round((to - from) / 86400000) + 1;
-if (S.closingOn && S.periodUnit === 'MONTH') {
-const anchor  = parseInt(S.periodStartDay) || 25;
-// 各月ごとに lastDay でクランプ（29〜31日 + うるう年2月対応）
-let fy = from.getFullYear(), fm = from.getMonth() + 1 + dir;
-if (fm < 1)  { fm += 12; fy--; }
-if (fm > 12) { fm -= 12; fy++; }
-const newFrom = new Date(fy, fm - 1, Math.min(anchor + 1, lastDay(fy, fm)));
-let ty = fy, tm = fm + 1;
-if (tm > 12) { tm -= 12; ty++; }
-const newTo = new Date(ty, tm - 1, Math.min(anchor, lastDay(ty, tm)));
-_bmPeriodFrom = `${newFrom.getFullYear()}-${pad(newFrom.getMonth()+1)}-${pad(newFrom.getDate())}`;
-_bmPeriodTo   = `${newTo.getFullYear()}-${pad(newTo.getMonth()+1)}-${pad(newTo.getDate())}`;
+const unit = S.periodUnit || 'MONTH';
+if (unit === 'WEEK') {
+const f = _parseYmd(_bmPeriodFrom); f.setDate(f.getDate() + dir * 7);
+const t = _parseYmd(_bmPeriodTo);   t.setDate(t.getDate() + dir * 7);
+_bmPeriodFrom = _ymd(f);
+_bmPeriodTo   = _ymd(t);
+} else if (unit === 'YEAR') {
+const y = parseInt(_bmPeriodFrom.slice(0, 4)) + dir;
+_bmPeriodFrom = `${y}-01-01`;
+_bmPeriodTo   = `${y}-12-31`;
+} else if (unit === 'SEASON') {
+const anchor = parseInt(S.periodStartDay) || 25;
+const p = _calcSeasonPeriod(_parseYmd(_bmPeriodFrom), S.seasonType || 'Q', !!S.closingOn, anchor, dir);
+_bmPeriodFrom = p.from;
+_bmPeriodTo   = p.to;
+} else if (S.closingOn) {
+const p = dir < 0 ? _calcPrevClosingPeriod(_bmPeriodFrom) : _calcNextClosingPeriod(_bmPeriodTo);
+_bmPeriodFrom = p.from;
+_bmPeriodTo   = p.to;
 } else {
-// 締日連動OFF：日数加算ではなくカレンダー月単位で移動（月日数差によるズレを防ぐ）
-let ny = from.getFullYear(), nm = from.getMonth() + 1 + dir;
+let ny = parseInt(_bmPeriodFrom.slice(0, 4)), nm = parseInt(_bmPeriodFrom.slice(5, 7)) + dir;
 if (nm < 1)  { nm += 12; ny--; }
 if (nm > 12) { nm -= 12; ny++; }
-const newFrom = new Date(ny, nm - 1, 1);
-const newTo   = new Date(ny, nm, 0);  // nm月の末日
-_bmPeriodFrom = `${newFrom.getFullYear()}-${pad(newFrom.getMonth()+1)}-01`;
-_bmPeriodTo   = `${newTo.getFullYear()}-${pad(newTo.getMonth()+1)}-${pad(newTo.getDate())}`;
+_bmPeriodFrom = `${ny}-${_pad2(nm)}-01`;
+_bmPeriodTo   = `${ny}-${_pad2(nm)}-${_pad2(_lastDayOfMonth(ny, nm))}`;
 }
 _bmRender();
 }
@@ -2162,18 +2432,31 @@ _bmRender();
 function bmSetMode(mode) {
 S.budgetMode = mode;
 try { DB.setSetting('budgetMode', mode); } catch(e) {}
+if (mode === 'BM_AUTO') {
+_autoRolloverBudgetIfNeeded({ from: _bmPeriodFrom, to: _bmPeriodTo });
+}
 _bmRender();
+_renderBmCurrentSummary();
 }
 
 function bmSaveBase() {
-const val = parseInt(document.getElementById('bm-base-input')?.value) || 0;
-if (val < 0) return;
+const raw = document.getElementById('bm-base-input')?.value?.trim() ?? '';
+const val = Number(raw);
+if (raw === '' || isNaN(val) || val < 0) {
+showToast('0以上の金額を入力してください');
+return;
+}
+const intVal = Math.round(val);
 _checkStartMonthGuard(_bmPeriodFrom.slice(0, 7), () => {
 try {
-DB.setBudgetBase(_bmPeriodFrom, _bmPeriodTo, val);
-if (_bmPeriodFrom === getCurrentPeriod().from) S.baseBudget = String(val);
+DB.setBudgetBase(_bmPeriodFrom, _bmPeriodTo, intVal);
+if (_bmPeriodFrom === getCurrentPeriod().from) {
+S.baseBudget = String(intVal);
+try { DB.setSetting('baseBudget', String(intVal)); } catch(e) {}
+}
 _bmRender();
 updateSummary();
+_renderBmCurrentSummary();
 } catch(e) { alert('保存に失敗しました'); }
 });
 }
@@ -2185,7 +2468,7 @@ const isNew = !id;
 _bmShowSub(
 `<div class="bm-sub-box">` +
 `<div class="bm-sub-title">${isNew ? '臨時収入を追加' : '臨時収入を編集'}</div>` +
-`<div class="bm-sub-field"><div class="bm-sub-label">名称（例：夏季賞与、臨時収入）</div><input type="text" id="bex-name" value="${_escQ(name)}" placeholder="名称" class="bm-sub-input"></div>` +
+`<div class="bm-sub-field"><div class="bm-sub-label">名称（例：夏季賞与、臨時収入）</div><input type="text" id="bex-name" value="${_escHtml(name)}" placeholder="名称" class="bm-sub-input"></div>` +
 `<div class="bm-sub-field"><div class="bm-sub-label">金額（円）</div><input type="number" id="bex-amount" value="${amount||''}" placeholder="0" class="bm-sub-input"></div>` +
 `<div class="bm-sub-btns"><button onclick="vibe();_bmCloseSub()" class="bm-sub-cancel">キャンセル</button><button onclick="vibe();_bmSaveExtra(${id||'null'})" class="bm-sub-ok">保存</button></div>` +
 `</div>`
@@ -2218,18 +2501,15 @@ function bmAddFixed()                      { _bmFixedDialog(null, '', 0, ''); }
 function bmEditFixed(id, name, amount, vf) { _bmFixedDialog(id, name, amount, vf); }
 function _bmFixedDialog(id, name, amount, existingVf) {
 const isNew = !id;
-// 適用開始日 = 対象期間の月初（_bmPeriodFrom の月初）
-const pad = n => String(n).padStart(2, '0');
-const bmFrom = new Date(_bmPeriodFrom + 'T00:00:00');
-const monthStart = `${bmFrom.getFullYear()}-${pad(bmFrom.getMonth()+1)}-01`;
-const defaultFrom = monthStart;  // 常に対象期間の月初
+const monthStart = _getFixedLookupDate(_bmPeriodFrom, _bmPeriodTo, !!S.closingOn);
+const existingNote = (!isNew && existingVf) ? `（現在の適用開始: ${_escHtml(existingVf.slice(0, 7))}）` : '';
 _bmShowSub(
 `<div class="bm-sub-box">` +
 `<div class="bm-sub-title">${isNew ? '固定費を追加' : '固定費を編集'}</div>` +
-`<div class="bm-sub-field"><div class="bm-sub-label">名称</div><input type="text" id="bfc-name" value="${_escQ(name)}" placeholder="家賃、電気代など" class="bm-sub-input"></div>` +
+`<div class="bm-sub-field"><div class="bm-sub-label">名称</div><input type="text" id="bfc-name" value="${_escHtml(name)}" placeholder="家賃、電気代など" class="bm-sub-input"></div>` +
 `<div class="bm-sub-field"><div class="bm-sub-label">金額（円）</div><input type="number" id="bfc-amount" value="${amount||''}" placeholder="0" class="bm-sub-input"></div>` +
 `<div class="bm-sub-field"><div class="bm-sub-label">適用開始日（月初）<span style="font-size:10px;color:#94a3b8;"> 対象期間に連動</span></div><input type="month" id="bfc-from-month" value="${monthStart.slice(0,7)}" class="bm-sub-input"></div>` +
-(!isNew ? `<div style="font-size:11px;color:#e67e22;margin:-4px 0 8px;">※ 変更前の履歴は保持されます</div>` : '') +
+(!isNew ? `<div style="font-size:11px;color:#e67e22;margin:-4px 0 8px;">※ 変更前の履歴は保持されます${existingNote}</div>` : '') +
 `<div class="bm-sub-btns"><button onclick="vibe();_bmCloseSub()" class="bm-sub-cancel">キャンセル</button><button onclick="vibe();_bmSaveFixed(${id||'null'})" class="bm-sub-ok">保存</button></div>` +
 `</div>`
 );
@@ -2237,9 +2517,7 @@ _bmShowSub(
 function _bmSaveFixed(id) {
 const n  = document.getElementById('bfc-name')?.value?.trim();
 const a  = parseInt(document.getElementById('bfc-amount')?.value) || 0;
-// type=month の値は "YYYY-MM" → 月初日付に変換
 const monthVal = document.getElementById('bfc-from-month')?.value;
-// 利用開始月が設定されている場合、valid_from をそれ以降にクランプ
 let vfRaw = monthVal ? monthVal + '-01' : getCurrentPeriod().from;
 if (S.appStartMonth && vfRaw.slice(0, 7) < S.appStartMonth) {
 vfRaw = S.appStartMonth + '-01';
@@ -2250,39 +2528,34 @@ _checkStartMonthGuard(monthVal || getCurrentPeriod().from.slice(0, 7), () => {
 try {
 if (!id) { DB.addFixedCostHistory(n, a, 0, vf); }
 else      { DB.changeFixedCostHistory(id, n, a, 0, vf); }
-_bmCloseSub(); _bmRender(); updateSummary(); updateFixedTotalBadge(); _clearEarliestDateCache();
+_bmCloseSub(); _bmRender(); updateSummary(); updateFixedTotalBadge(); _renderBmCurrentSummary(); _clearEarliestDateCache();
 } catch(e) { alert('保存に失敗しました'); }
 });
 }
 function bmDeleteFixed(id, name) {
-// 削除終了月のデフォルト = 対象期間の月末
-const pad  = n => String(n).padStart(2, '0');
-const bmTo = new Date(_bmPeriodTo + 'T00:00:00');
-const defMonth = bmTo.getFullYear() + '-' + pad(bmTo.getMonth()+1);
+const bmTo = _parseYmd(_bmPeriodTo);
+const defMonth = bmTo.getFullYear() + '-' + _pad2(bmTo.getMonth()+1);
 _bmShowSub(
 `<div class="bm-sub-box">` +
 `<div class="bm-sub-title">削除の確認</div>` +
-`<div style="font-size:13px;color:#475569;margin-bottom:6px;">「${name}」を削除します。</div>` +
+`<div style="font-size:13px;color:#475569;margin-bottom:6px;">「${_escHtml(name)}」を削除します。</div>` +
 `<div class="bm-sub-field"><div class="bm-sub-label">終了月（翌月以降は計上されなくなります）</div><input type="month" id="bfc-end-month" value="${defMonth}" class="bm-sub-input"></div>` +
 `<div class="bm-sub-btns"><button onclick="vibe();_bmCloseSub()" class="bm-sub-cancel">キャンセル</button><button onclick="vibe();_bmConfirmDeleteFixed(${id})" class="bm-sub-del">削除</button></div>` +
 `</div>`
 );
 }
 function _bmConfirmDeleteFixed(id) {
-// type=month → 月末日に変換（その月末の翌日=来月1日をvalid_toに設定）
-const pad = n => String(n).padStart(2, '0');
 const monthVal = document.getElementById('bfc-end-month')?.value;
 let endDate;
 if (monthVal) {
 const [y, m] = monthVal.split('-').map(Number);
-// valid_to は「その月末翌日（= 来月1日）」とする（DBは valid_to > periodFrom で判定）
 const nextM = m === 12 ? 1 : m + 1;
 const nextY = m === 12 ? y + 1 : y;
-endDate = `${nextY}-${pad(nextM)}-01`;
+endDate = `${nextY}-${_pad2(nextM)}-01`;
 } else {
 endDate = _bmPeriodTo;
 }
-try { DB.endFixedCostHistory(id, endDate); _bmCloseSub(); _bmRender(); updateSummary(); updateFixedTotalBadge(); } catch(e) {}
+try { DB.endFixedCostHistory(id, endDate); _bmCloseSub(); _bmRender(); updateSummary(); updateFixedTotalBadge(); _renderBmCurrentSummary(); } catch(e) {}
 }
 
 
@@ -2328,13 +2601,12 @@ showModal('エラー', 'ファイルピッカーを開けませんでした。<b
 function onImportFileReady(metaJson) {
 try {
 const meta = JSON.parse(metaJson);
-const fileAcct  = meta.fileAccount    || '不明';
-const exportedAt = meta.exportedAt    || '不明';
-const count     = meta.recordCount    || 0;
-const curAcct   = meta.currentAccount || '不明';
+const fileAcct   = _escHtml(meta.fileAccount    || '不明');
+const exportedAt = _escHtml(meta.exportedAt     || '不明');
+const count      = Number(meta.recordCount || 0);
+const curAcct    = _escHtml(meta.currentAccount || '不明');
 
-// 別アカウントのデータかどうか警告
-const isDiff = fileAcct !== '不明' && fileAcct !== curAcct;
+const isDiff = (meta.fileAccount || '不明') !== '不明' && meta.fileAccount !== meta.currentAccount;
 const warnHtml = isDiff
 ? `<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:8px 10px;margin-top:8px;font-size:12px;color:#856404;">
 ⚠️ ファイルのアカウント（<b>${fileAcct}</b>）と<br>
@@ -2374,46 +2646,42 @@ if (!result || result === '') {
 refreshAfterImport();
 _clearEarliestDateCache(); showModal('インポート完了', 'データのインポートが完了しました。', false);
 } else {
-showModal('エラー', 'インポートに失敗しました。<br><span style="font-size:11px;">' + result + '</span>', false);
+showModal('エラー', 'インポートに失敗しました。<br><span style="font-size:11px;">' + _escHtml(result) + '</span>', false);
 }
 } catch(e) {
-showModal('エラー', 'インポートに失敗しました。<br>' + e.message, false);
+showModal('エラー', 'インポートに失敗しました。<br>' + _escHtml(e.message), false);
 }
 });
 
-// OKボタンのテキストを変更
 const okBtn = document.getElementById('modal-ok');
 if (okBtn) okBtn.innerText = 'インポート実行';
 
 } catch(e) {
-showModal('エラー', 'ファイルの解析に失敗しました。<br>' + e.message, false);
+showModal('エラー', 'ファイルの解析に失敗しました。<br>' + _escHtml(e.message), false);
 }
 }
 
-// 旧フロー互換（直接インポート結果が来た場合のフォールバック）
 function onImportFileResult(result) {
 if (!result) {
 refreshAfterImport();
 _clearEarliestDateCache(); showModal('インポート完了', 'データのインポートが完了しました。', false);
 } else {
-showModal('エラー', 'インポートに失敗しました。<br><span style="font-size:11px;">' + result + '</span>', false);
+showModal('エラー', 'インポートに失敗しました。<br><span style="font-size:11px;">' + _escHtml(result) + '</span>', false);
 }
 }
 
 function refreshAfterImport() {
 try {
-// ① 設定を DB から再読み込みして画面に即時反映（最重要）
 loadSettingsFromDB();
-_clearEarliestDateCache();  // appStartMonth が変わったのでキャッシュを破棄
+_clearEarliestDateCache();
 updateFixedTotalBadge();
+_renderBmCurrentSummary();
 
-// ② 入力タブ: マスター・サマリー・情報パネル再読み込み
-if (typeof loadMaster === 'function') loadMaster();
+if (typeof refresh === 'function') refresh();
 if (typeof updateSummary === 'function') updateSummary();
 if (typeof renderInfoPanel === 'function') renderInfoPanel();
 if (typeof refreshPointsCardUI === 'function') refreshPointsCardUI();
 
-// ③ 履歴タブ: 検索状態クリアして再描画
 searchMode = false;
 selItems.clear();
 updateFab();
@@ -2425,8 +2693,7 @@ currentOffset = 0;
 document.getElementById('displayArea').innerHTML = '';
 loadMore();
 }
-
-// ④ アカウント情報も更新
+if (document.getElementById('view-analytics')?.style.display === 'block') renderAnalytics();
 if (typeof initAccount === 'function') initAccount();
 } catch(e) { console.error('refreshAfterImport:', e); }
 }
@@ -2456,9 +2723,9 @@ const isCur = a.id === acctInfo.current;
 return `<div class="acct-setting-row ${isCur?'acct-setting-cur':''}">
 <div style="display:flex;align-items:center;gap:8px;flex:1;">
 <span class="acct-setting-dot ${isCur?'acct-dot-on':''}"></span>
-<span id="acct-name-disp-${a.id}" class="acct-name-text">${a.name}</span>
+<span id="acct-name-disp-${a.id}" class="acct-name-text">${_escHtml(a.name)}</span>
 <input id="acct-name-input-${a.id}" class="acct-name-input" type="text"
-value="${a.name}" style="display:none;"
+value="${_escHtml(a.name)}" style="display:none;"
 onblur="commitAcctName(${a.id})" onkeydown="if(event.key==='Enter')this.blur()">
 </div>
 <div style="display:flex;gap:6px;align-items:center;">
@@ -2485,12 +2752,11 @@ function toggleAcctDropdown() {
 const dd = document.getElementById('acct-dropdown');
 const arrow = document.getElementById('acct-arrow');
 if (dd.style.display === 'none') {
-// 内容を生成
 const inner = document.getElementById('acct-dd-inner');
 inner.innerHTML = acctInfo.accounts.map(a => {
 const isCur = a.id === acctInfo.current;
 return `<div class="acct-dd-item ${isCur?'acct-dd-cur':''}" onclick="vibe();${isCur?'closeAcctDropdown()':'confirmSwitchAccount('+a.id+')'}">
-${isCur ? '✓ ' : ''}${a.name}
+${isCur ? '✓ ' : ''}${_escHtml(a.name)}
 </div>`;
 }).join('');
 dd.style.display = 'flex';
@@ -2524,7 +2790,6 @@ try { DB.switchAccount(id); } catch(e) { showModal('エラー', e.message, false
 
 // ===== アカウントリセット =====
 function openAccountResetModal() {
-// ステップ1：リセットするアカウントを選択
 const rows = acctInfo.accounts.map(a => {
 const isCur = a.id === acctInfo.current;
 return '<button onclick="vibe();selectAccountToReset(' + a.id + ')" style="' +
@@ -2533,7 +2798,7 @@ return '<button onclick="vibe();selectAccountToReset(' + a.id + ')" style="' +
 'border-radius:12px;background:' + (isCur ? '#fff1f2' : '#f8fafc') + ';' +
 'font-size:14px;font-weight:' + (isCur ? '700' : '500') + ';' +
 'color:' + (isCur ? '#e11d48' : '#1e293b') + ';text-align:left;cursor:pointer;">' +
-(isCur ? '⚠️ ' : '') + a.name + (isCur ? '（使用中）' : '') +
+(isCur ? '⚠️ ' : '') + _escHtml(a.name) + (isCur ? '（使用中）' : '') +
 '</button>';
 }).join('');
 const body =
@@ -2551,14 +2816,13 @@ function selectAccountToReset(id) {
 const target = acctInfo.accounts.find(a => a.id === id);
 if (!target) return;
 const isCur = id === acctInfo.current;
-// ステップ2：確認ダイアログ（アカウント名入力）
 const body =
 '<p style="margin:0 0 10px;font-size:14px;line-height:1.6;">' +
-'<strong style="color:#e11d48;">' + target.name + '</strong> のデータをすべて削除します。<br>' +
+'<strong style="color:#e11d48;">' + _escHtml(target.name) + '</strong> のデータをすべて削除します。<br>' +
 (isCur ? '<span style="font-size:12px;color:#e11d48;">⚠️ 現在使用中のアカウントです</span><br>' : '') +
 '</p>' +
 '<p style="font-size:13px;color:#64748b;margin:0 0 12px;">確認のため、アカウント名を入力してください。</p>' +
-'<input id="reset-confirm-input" type="text" placeholder="' + target.name + '" ' +
+'<input id="reset-confirm-input" type="text" placeholder="' + _escHtml(target.name) + '" ' +
 'style="width:100%;padding:12px;border:2px solid #e11d48;border-radius:10px;' +
 'font-size:15px;box-sizing:border-box;margin-bottom:12px;">' +
 '<div style="display:flex;gap:8px;">' +
@@ -2570,7 +2834,6 @@ const body =
 '</div>';
 document.getElementById('modal-title').innerText = '⚠️ 最終確認';
 document.getElementById('modal-body').innerHTML  = body;
-// modal-btns は既に非表示
 setTimeout(() => document.getElementById('reset-confirm-input')?.focus(), 100);
 }
 
@@ -2593,38 +2856,60 @@ showModal('エラー', 'リセットに失敗しました: ' + e.message, false)
 }
 }
 
-// KotlinからJS側に呼ばれるコールバック（リセット完了）
 function onAccountReset(infoJson) {
 acctInfo = JSON.parse(infoJson);
-// リセット後は初期設定を適用してクリーンな状態に
 _applyInitialSettings();
-loadMaster?.();
+_clearEarliestDateCache();
 selItems.clear();
 currentOffset = 0;
 document.getElementById('displayArea').innerHTML = '';
-updateSummary();
 refresh();
+updateSummary();
 updateFixedTotalBadge();
+_renderBmCurrentSummary();
+renderInfoPanel();
 renderAcctSettings();
+if (document.getElementById('view-analytics')?.style.display === 'block') renderAnalytics();
 showToast('アカウントをリセットしました');
 }
 
-// KotlinからJS側に呼ばれるコールバック
 function onAccountSwitched(infoJson) {
 acctInfo = JSON.parse(infoJson);
 renderAcctHeader();
 renderAcctSettings();
-// 設定をアカウントのDBから再読み込み（appStartMonth も更新される）
 loadSettingsFromDB();
-_clearEarliestDateCache();  // appStartMonth が変わったのでキャッシュを破棄
-// データ再読み込み
+_clearEarliestDateCache();
+anUseClosing = null;
+anPreset = 'MONTH';
+anCatIds = [];
+anTagIds = [];
+anMemo = '';
+anPtsBreakdown = false;
+document.querySelectorAll('.an-period-chip').forEach(el =>
+el.classList.toggle('selected', el.dataset.v === 'MONTH'));
+const customArea = document.getElementById('an-custom-period');
+if (customArea) customArea.style.display = 'none';
+_updateAnActiveChips();
+searchMode = false;
+searchFilter = {
+categoryIds:[], tagIds:[], memo:'', cardIds:[],
+periodPreset:'ALL', dateFrom:'', dateTo:'',
+useCustom:false, useSort:false, sorts:[],
+isDeleteHistory: (mode === 'DELETE')
+};
+const srchBar = document.getElementById('srch-active-bar');
+if (srchBar) srchBar.style.display = 'none';
+document.getElementById('tab-search')?.classList.remove('active');
 selItems.clear();
 currentOffset = 0;
 document.getElementById('displayArea').innerHTML = '';
-updateSummary();
 refresh();
+updateSummary();
+updateFixedTotalBadge();
+_renderBmCurrentSummary();
+renderInfoPanel();
+refreshPointsCardUI();
 if (document.getElementById('view-history')?.style.display === 'block') loadMore();
-// 分析タブが開いていれば即再描画
 if (document.getElementById('view-analytics')?.style.display === 'block') renderAnalytics();
 }
 
@@ -2678,19 +2963,22 @@ if (preset !== 'CUSTOM') renderAnalytics();
 }
 
 function getAnDateRange() {
-// 期間を返す前に最古記録日でクランプ（データのない空期間を除去）
 const _rawRange = _getAnDateRangeRaw();
+if (anPreset === 'CUSTOM') return _rawRange;
 const _earliest = _getEarliestRecordDate();
-return {
-from: (!_rawRange.from || _rawRange.from < _earliest) ? _earliest : _rawRange.from,
-to:   _rawRange.to
-};
+if (anPreset === 'ALL') {
+return { from: S.appStartMonth ? _earliest : '', to: _rawRange.to };
+}
+const clampedFrom = (!_rawRange.from || _rawRange.from < _earliest) ? _earliest : _rawRange.from;
+if (_rawRange.to && clampedFrom > _rawRange.to) {
+return _rawRange;
+}
+return { from: clampedFrom, to: _rawRange.to };
 }
 function _getAnDateRangeRaw() {
 const useClosing = (anUseClosing !== null) ? anUseClosing : (S.closingOn === true || S.closingOn === 'true');
 const now   = new Date();
-const pad   = n => String(n).padStart(2,'0');
-const today = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate());
+const today = _todayYmd();
 
 if (anPreset === 'CUSTOM') {
 return {
@@ -2702,82 +2990,51 @@ if (anPreset === 'ALL') return { from: '', to: '' };
 
 // ── 締日連動ON：全プリセットを締日期間ベースで計算 ──────────────
 if (useClosing) {
-const p = getCurrentPeriod();           // 現在の締日期間
+const anchor = parseInt(S.periodStartDay) || 25;
+const p = _calcClosingPeriodForDate(now, anchor);
 if (anPreset === 'MONTH')      return { from: p.from, to: p.to };
 if (anPreset === 'PREV_MONTH') {
-const prev = _calcPrevClosingPeriod(p.from);
+const prev = _calcPrevClosingPeriod(p.from, anchor);
 return { from: prev.from, to: prev.to };
 }
-// 3M/6M/1Y：N期分さかのぼる
 const nPeriods = anPreset === '3M' ? 3 : anPreset === '6M' ? 6 : 12;
-// N-1期前の from を求める（現在期間が1期目）
 let startFrom = p.from;
 for (let i = 1; i < nPeriods; i++) {
-startFrom = _calcPrevClosingPeriod(startFrom).from;
+startFrom = _calcPrevClosingPeriod(startFrom, anchor).from;
 }
 return { from: startFrom, to: p.to };
 }
 
 // ── 締日連動OFF：カレンダー月ベース ───────────────────────────
 if (anPreset === 'MONTH') {
-const from = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-01';
-const monthEnd = new Date(now.getFullYear(), now.getMonth()+1, 0);
-const to = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(monthEnd.getDate());
-return { from, to };
+const y = now.getFullYear(), m = now.getMonth() + 1;
+return {
+from: `${y}-${_pad2(m)}-01`,
+to:   `${y}-${_pad2(m)}-${_pad2(_lastDayOfMonth(y, m))}`
+};
 }
 if (anPreset === 'PREV_MONTH') {
 const prev = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-const last = new Date(now.getFullYear(), now.getMonth(), 0);
+const y = prev.getFullYear(), m = prev.getMonth() + 1;
 return {
-from: prev.getFullYear() + '-' + pad(prev.getMonth()+1) + '-01',
-to:   last.getFullYear() + '-' + pad(last.getMonth()+1) + '-' + pad(last.getDate())
+from: `${y}-${_pad2(m)}-01`,
+to:   `${y}-${_pad2(m)}-${_pad2(_lastDayOfMonth(y, m))}`
 };
 }
-// 3M/6M/1Y：カレンダー月初まで遡る（to は当月末 → 未来の支出も含める）
 const monthsBack = anPreset === '3M' ? 3 : anPreset === '6M' ? 6 : 12;
-let startY = now.getFullYear(), startM = now.getMonth() + 1 - monthsBack;
+let startY = now.getFullYear(), startM = now.getMonth() + 1 - (monthsBack - 1);
 while (startM < 1) { startM += 12; startY--; }
-const from = startY + '-' + pad(startM) + '-01';
-const curMonthEnd = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' +
-pad(new Date(now.getFullYear(), now.getMonth()+1, 0).getDate());
-return { from, to: curMonthEnd };
+const endY = now.getFullYear(), endM = now.getMonth() + 1;
+return {
+from: `${startY}-${_pad2(startM)}-01`,
+to:   `${endY}-${_pad2(endM)}-${_pad2(_lastDayOfMonth(endY, endM))}`
+};
 }
 
 // 指定日を含む締日期間の開始日を返す（境界スナップ）
 function _snapToClosingPeriodStart(dateStr, anchor) {
-const pad     = n => String(n).padStart(2, '0');
-const lastDay = (y, m) => new Date(y, m, 0).getDate();
 if (!dateStr) return dateStr;
-const d   = new Date(dateStr + 'T00:00:00');
-const day = d.getDate();
-let y = d.getFullYear(), m = d.getMonth() + 1;  // 1-indexed
-if (day <= anchor) {
-// この日は前月から始まる期間に属する → 前月 anchor+1 日が開始
-m -= 1;
-if (m < 1) { m += 12; y -= 1; }
-}
-// m月の anchor+1 日（月末を超えないようクランプ）
-const startDay = Math.min(anchor + 1, lastDay(y, m));
-return y + '-' + pad(m) + '-' + pad(startDay);
-}
-
-// 締日ベースで1期前の期間を計算
-function _calcPrevClosingPeriod(currentFrom) {
-const pad     = n => String(n).padStart(2,'0');
-const lastDay = (y,m) => new Date(y,m,0).getDate();
-const anchor  = parseInt(S.periodStartDay) || 25;
-// 各月ごとに lastDay でクランプ（29〜31日 + うるう年2月対応）
-const from    = new Date(currentFrom + 'T00:00:00');
-let fy = from.getFullYear(), fm = from.getMonth() + 1 - 1; // 1ヶ月前
-if (fm < 1) { fm += 12; fy--; }
-const newFrom = new Date(fy, fm - 1, Math.min(anchor + 1, lastDay(fy, fm)));
-let ty = fy, tm = fm + 1;
-if (tm > 12) { tm -= 12; ty++; }
-const newTo = new Date(ty, tm - 1, Math.min(anchor, lastDay(ty, tm)));
-return {
-from: `${newFrom.getFullYear()}-${pad(newFrom.getMonth()+1)}-${pad(newFrom.getDate())}`,
-to:   `${newTo.getFullYear()}-${pad(newTo.getMonth()+1)}-${pad(newTo.getDate())}`
-};
+return _calcClosingPeriodForDate(_parseYmd(dateStr), anchor).from;
 }
 
 // 固定費トグル
@@ -2897,7 +3154,7 @@ if (!body || !btn) return;
 const collapsed = body.style.display === 'none';
 body.style.display = collapsed ? '' : 'none';
 btn.textContent = collapsed ? '▲' : '▼';
-renderAnalytics();
+_fixSummaryScrollHeight();
 }
 
 // グラフエリア折り畳み
@@ -2934,41 +3191,25 @@ btn.querySelector('.an-closing-label').innerText = useClosing ? '📅 締日連�
 // ===== 最古支出記録日を取得（キャッシュ付き）=====
 function _getEarliestRecordDate() {
 if (_anEarliestDate) return _anEarliestDate;
-// 利用開始月が設定済みならそれを最優先
 if (S.appStartMonth) {
 _anEarliestDate = S.appStartMonth + '-01';
 return _anEarliestDate;
 }
-// 未設定時：getMonthlyStats(120) で最大10年分スキャン
 try {
-const raw = JSON.parse(DB.getMonthlyStatsFiltered(120, '{}'));
-let earliest = null;
-for (const m of raw) {
-const ym = m.month || m.yearMonth || '';
-if (!ym) continue;
-if ((m.total || 0) > 0) {
-if (!earliest || ym < earliest) earliest = ym;
+if (typeof DB.getEarliestExpenseDate === 'function') {
+const d = DB.getEarliestExpenseDate();
+if (d) {
+_anEarliestDate = d.slice(0, 7) + '-01';
+return _anEarliestDate;
 }
 }
-if (earliest) {
-_anEarliestDate = earliest + '-01';
-} else {
-const now = new Date();
-const pad = n => String(n).padStart(2,'0');
-_anEarliestDate = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-01';
-}
-} catch(e) {
-const now = new Date();
-const pad = n => String(n).padStart(2,'0');
-_anEarliestDate = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-01';
-}
+} catch(e) {}
+_anEarliestDate = _todayYmd().slice(0, 7) + '-01';
 return _anEarliestDate;
 }
 
-// キャッシュを破棄（新規入力後などに呼ぶ）
 function _clearEarliestDateCache() { _anEarliestDate = null; }
 
-// ===== 履歴アクティブチップ更新 =====
 function _updateSearchActiveChips() {
 const el = document.getElementById('srch-active-chips');
 if (!el) return;
@@ -2976,23 +3217,29 @@ try {
 const cats  = JSON.parse(DB.getMaster('categories')  || '[]');
 const tags  = JSON.parse(DB.getMaster('custom_tags') || '[]');
 const cards = JSON.parse(DB.getMaster('point_cards') || '[]');
+const costs = JSON.parse(DB.getMaster('cost_tags')   || '[]');
 const catMap = {}, tagMap = {}, cardMap = {};
 cats.forEach(c  => { catMap[c.id]  = c.name; });
 tags.forEach(t  => { tagMap[t.id]  = t.name; });
 cards.forEach(c => { cardMap[c.id] = c.name; });
+costs.forEach(c => { cardMap[c.id] = c.name; });
 
+const PRESET_NAMES = { MONTH:'当月', PREV_MONTH:'前月', '3M':'3ヶ月', '6M':'半年', '1Y':'1年' };
 const chips = [];
 searchFilter.categoryIds.forEach(id => chips.push({ label: catMap[id] || `cat${id}`, type: 'cat' }));
 searchFilter.tagIds.forEach(id       => chips.push({ label: tagMap[id]  || `tag${id}`, type: 'tag' }));
 searchFilter.cardIds.forEach(id      => chips.push({ label: cardMap[id] || `card${id}`, type: 'card' }));
 if (searchFilter.memo) chips.push({ label: `"${searchFilter.memo}"`, type: 'memo' });
-if (searchFilter.useCustom || searchFilter.periodPreset !== 'ALL')
-chips.push({ label: searchFilter.periodPreset !== 'ALL' ? searchFilter.periodPreset : '期間指定', type: 'period' });
+if (searchFilter.useCustom) {
+chips.push({ label: (searchFilter.dateFrom || '') + '〜' + (searchFilter.dateTo || ''), type: 'period' });
+} else if (searchFilter.periodPreset !== 'ALL') {
+chips.push({ label: PRESET_NAMES[searchFilter.periodPreset] || searchFilter.periodPreset, type: 'period' });
+}
 if (searchFilter.useSort && searchFilter.sorts.length)
 chips.push({ label: '並替', type: 'sort' });
 
 el.innerHTML = chips.map(c =>
-`<span class="active-chip active-chip-${c.type}">${c.label}</span>`
+`<span class="active-chip active-chip-${c.type}">${_escHtml(c.label)}</span>`
 ).join('') || '<span class="active-chip">全件</span>';
 } catch(e) { el.innerHTML = '<span class="active-chip">絞込み中</span>'; }
 }
@@ -3002,10 +3249,10 @@ const cats  = JSON.parse(DB.getMaster('categories')  || '[]');
 const tags  = JSON.parse(DB.getMaster('custom_tags') || '[]');
 document.getElementById('an-cat-area').innerHTML = cats.map(c =>
 `<div class="srch-chip ${anCatIds.includes(c.id)?'selected':''}"
-onclick="vibe();toggleAnId('anCatIds',${c.id},this)">${c.name}</div>`).join('');
+onclick="vibe();toggleAnId('anCatIds',${c.id},this)">${_escHtml(c.name)}</div>`).join('');
 document.getElementById('an-tag-area').innerHTML = tags.map(t =>
 `<div class="srch-chip ${anTagIds.includes(t.id)?'selected':''}"
-onclick="vibe();toggleAnId('anTagIds',${t.id},this)">${t.name}</div>`).join('');
+onclick="vibe();toggleAnId('anTagIds',${t.id},this)">${_escHtml(t.name)}</div>`).join('');
 const memoEl = document.getElementById('an-memo');
 if (memoEl) memoEl.value = anMemo;
 document.getElementById('an-filter-modal').style.display = 'flex';
@@ -3068,7 +3315,7 @@ anCatIds.forEach(id => chips.push({ label: catMap[id] || `cat${id}`, type: 'cat'
 anTagIds.forEach(id => chips.push({ label: tagMap[id] || `tag${id}`, type: 'tag' }));
 if (anMemo) chips.push({ label: `"${anMemo}"`, type: 'memo' });
 chipsEl.innerHTML = chips.map(c =>
-`<span class="active-chip active-chip-${c.type}">${c.label}</span>`
+`<span class="active-chip active-chip-${c.type}">${_escHtml(c.label)}</span>`
 ).join('');
 const parts = [];
 if (anCatIds.length) parts.push(`カテゴリ${anCatIds.length}件`);
@@ -3117,29 +3364,26 @@ function showAnEmpty() {
 if (anChart) { anChart.destroy(); anChart = null; }
 document.getElementById('an-empty').style.display = 'block';
 document.getElementById('an-canvas').style.display = 'none';
-document.getElementById('an-summary-content').innerHTML = '';
+document.getElementById('an-summary-content').innerHTML = '<div class="an-scroll-body" id="an-scroll-body"></div>';
+_fixSummaryScrollHeight();
 }
 
-// ===== 粒度判定ヘルパー =====
-// MONTH/PREV_MONTH/1〜31日のCUSTOM → 日別
-// 3M以内(〜92日) → 週別
-// それ以上 → 月別
 function _decideTrendGranularity(from, to) {
 if (!from) return 'monthly';
-const ms   = new Date(to) - new Date(from);
-const days = ms / 86400000 + 1;
+const ms   = _parseYmd(to) - _parseYmd(from);
+const days = Math.round(ms / 86400000) + 1;
 if (days <= 62)  return 'daily';
 if (days <= 120) return 'weekly';
 return 'monthly';
 }
 
-// 週別集計（日別データから変換）
 function _aggregateWeekly(dailyData) {
 const weeks = [];
 let bucket = null;
+const firstDay = _parseYmd(dailyData[0].date);
 dailyData.forEach(d => {
-const day = new Date(d.date);
-const weekNum = Math.floor((day - new Date(dailyData[0].date)) / (7 * 86400000));
+const day = _parseYmd(d.date);
+const weekNum = Math.floor(Math.round((day - firstDay) / 86400000) / 7);
 if (!bucket || bucket.weekNum !== weekNum) {
 bucket = { weekNum, label: d.date.slice(5).replace('-','/'), total: 0 };
 weeks.push(bucket);
@@ -3154,99 +3398,100 @@ function renderTrendChart() {
 try {
 destroyChart();
 const range = getAnDateRange();
-const filter = JSON.stringify({ categoryIds: anCatIds, tagIds: anTagIds, memo: anMemo });
+const biz = isBizMode();
+const baseFilter = { categoryIds: anCatIds, tagIds: anTagIds, memo: anMemo };
+const filter = JSON.stringify(biz ? Object.assign({}, baseFilter, { excludeCostTags: true }) : baseFilter);
+const expFilter = JSON.stringify(Object.assign({}, baseFilter, { onlyCostTags: true }));
 
-// 粒度判定
 const gran = _decideTrendGranularity(range.from, range.to);
 let labels, data, unitLabel, rawData = null;
+let rawMonthLabels = [];
+let _trendGross = 0, _trendExpense = 0;
 
 if (gran === 'daily') {
-// 日別（当月・前月・62日以内のCUSTOM）
-if (!range.from) { showAnEmpty(); return; }
-const dailyRaw = JSON.parse(DB.getDailyStats(range.from, range.to, filter));
-if (!dailyRaw || dailyRaw.length === 0) { showAnEmpty(); return; }
-labels = dailyRaw.map(d => {
+if (!range.from || (range.to && range.from > range.to)) { showAnEmpty(); return; }
+const dailyGross = JSON.parse(DB.getDailyStats(range.from, range.to, filter));
+if (!dailyGross || dailyGross.length === 0) { showAnEmpty(); return; }
+const dailyExp = biz ? JSON.parse(DB.getDailyStats(range.from, range.to, expFilter)) : [];
+labels = dailyGross.map(d => {
 const parts = d.date.split('-');
 return `${parseInt(parts[2])}日`;
 });
-// bizMode: 経費を期間全体で按分して各日から差し引く
-const _dailyTrendExp = isBizMode() ? _getExpenseTotalForRange(range.from || getCurrentPeriod().from, range.to || getCurrentPeriod().to) : 0;
-const _dailyExpPerDay = dailyRaw.length > 0 ? _dailyTrendExp / dailyRaw.length : 0;
-rawData = dailyRaw.map(d => Math.max(0, d.total - 2 * _dailyExpPerDay));
-// 累計に変換してグラフ表示
+_trendGross = dailyGross.reduce((s, d) => s + (d.total || 0), 0);
+_trendExpense = biz ? dailyExp.reduce((s, d) => s + (d.total || 0), 0) : 0;
+if (_trendGross === 0 && _trendExpense === 0) { showAnEmpty(); return; }
+rawData = dailyGross.map((d, i) => (d.total || 0) - (biz ? (dailyExp[i]?.total || 0) : 0));
 let cum = 0;
-data   = rawData.map(v => { cum += v; return cum; });
+data = rawData.map(v => { cum += v; return cum; });
 unitLabel = '日別';
 
 } else if (gran === 'weekly') {
-// 週別（3ヶ月以内）
-if (!range.from) { showAnEmpty(); return; }
-const dailyRaw = JSON.parse(DB.getDailyStats(range.from, range.to, filter));
-if (!dailyRaw || dailyRaw.length === 0) { showAnEmpty(); return; }
-const weeks = _aggregateWeekly(dailyRaw);
-labels  = weeks.map(w => w.label + '〜');
-const _weeklyTrendExp = isBizMode() ? _getExpenseTotalForRange(range.from, range.to) : 0;
-const _weeklyExpPerWeek = weeks.length > 0 ? _weeklyTrendExp / weeks.length : 0;
-rawData = weeks.map(w => Math.max(0, w.total - 2 * _weeklyExpPerWeek)); // サマリー計算用
+if (!range.from || (range.to && range.from > range.to)) { showAnEmpty(); return; }
+const dailyGross = JSON.parse(DB.getDailyStats(range.from, range.to, filter));
+if (!dailyGross || dailyGross.length === 0) { showAnEmpty(); return; }
+const dailyExp = biz ? JSON.parse(DB.getDailyStats(range.from, range.to, expFilter)) : [];
+_trendGross = dailyGross.reduce((s, d) => s + (d.total || 0), 0);
+_trendExpense = biz ? dailyExp.reduce((s, d) => s + (d.total || 0), 0) : 0;
+if (_trendGross === 0 && _trendExpense === 0) { showAnEmpty(); return; }
+const weeksGross = _aggregateWeekly(dailyGross);
+const weeksExp = biz ? _aggregateWeekly(dailyExp) : [];
+labels = weeksGross.map(w => w.label + '〜');
+rawData = weeksGross.map((w, i) => (w.total || 0) - (biz ? (weeksExp[i]?.total || 0) : 0));
 let cum2 = 0;
-data   = rawData.map(v => { cum2 += v; return cum2; });
+data = rawData.map(v => { cum2 += v; return cum2; });
 unitLabel = '週別';
 
 } else {
-// 月別（半年以上・ALL）
-const monthFilter = JSON.stringify({ categoryIds: anCatIds, tagIds: anTagIds, memo: anMemo });
-let monthRaw;
+let monthGrossRaw, monthExpRaw = [];
 if (anPreset === 'ALL') {
-monthRaw = JSON.parse(DB.getMonthlyStatsFiltered(60, monthFilter));
-// 利用開始月でフィルタ
+monthGrossRaw = JSON.parse(DB.getMonthlyStatsFiltered(60, filter));
+if (biz) monthExpRaw = JSON.parse(DB.getMonthlyStatsFiltered(60, expFilter));
 if (S.appStartMonth) {
-monthRaw = monthRaw.filter(m => m.month >= S.appStartMonth.slice(0,7));
+const startYm = S.appStartMonth.slice(0, 7);
+monthGrossRaw = monthGrossRaw.filter(m => m.month >= startYm);
+if (biz) monthExpRaw = monthExpRaw.filter(m => m.month >= startYm);
 }
+monthGrossRaw = [...monthGrossRaw].reverse();
+if (biz) monthExpRaw = [...monthExpRaw].reverse();
 } else if (range.from) {
-monthRaw = JSON.parse(DB.getMonthlyStatsByRangeFiltered(range.from, range.to, monthFilter));
+if (range.to && range.from > range.to) { showAnEmpty(); return; }
+monthGrossRaw = JSON.parse(DB.getMonthlyStatsByRangeFiltered(range.from, range.to, filter));
+if (biz) monthExpRaw = JSON.parse(DB.getMonthlyStatsByRangeFiltered(range.from, range.to, expFilter));
 } else {
-monthRaw = JSON.parse(DB.getMonthlyStatsFiltered(24, monthFilter));
+monthGrossRaw = JSON.parse(DB.getMonthlyStatsFiltered(24, filter));
+if (biz) monthExpRaw = JSON.parse(DB.getMonthlyStatsFiltered(24, expFilter));
+monthGrossRaw = [...monthGrossRaw].reverse();
+if (biz) monthExpRaw = [...monthExpRaw].reverse();
 }
-if (!monthRaw || monthRaw.length === 0) { showAnEmpty(); return; }
+if (!monthGrossRaw || monthGrossRaw.length === 0) { showAnEmpty(); return; }
 
-// getMonthlyStats（ALL用）は「現在→過去」順なので反転
-// getMonthlyStatsByRange（6M/1Y等）は既に古い順なので反転不要
-if (anPreset === 'ALL') {
-monthRaw = [...monthRaw].reverse();
-}
-
-// カテゴリ絞り込み（月別データのbreakdownから）
-// タグ絞り込みはbreakdownに情報がないためDB側に委ねる（月別は近似値）
-// 月ラベル保存（YYYY-MM形式、予算ライン生成用）
-const rawMonthLabels = monthRaw.map(m => m.month);
-const filtered = monthRaw.map(m => {
-if (anCatIds.length === 0) return { month: m.month, total: m.total };
+const extractMonthVal = m => {
+if (anCatIds.length === 0) return m.total || 0;
 if (m.breakdown) {
-const bd = m.breakdown.filter(b => anCatIds.includes(b.catId));
-return { month: m.month, total: bd.reduce((s,b) => s + b.amount, 0) };
+return m.breakdown.filter(b => anCatIds.includes(b.catId)).reduce((s, b) => s + b.amount, 0);
 }
-return { month: m.month, total: m.total };
-});
+return m.total || 0;
+};
+const expMap = {};
+monthExpRaw.forEach(m => { expMap[m.month] = extractMonthVal(m); });
 
-labels = filtered.map(m => m.month.slice(5) + '月');
-// bizMode: 月別に経費を差し引いて純売上を計算
-data = filtered.map(m => {
-if (!isBizMode()) return m.total;
-const pad = n => String(n).padStart(2,'0');
-const y = m.month.slice(0,4), mo = m.month.slice(5,7);
-const lastD = new Date(parseInt(y), parseInt(mo), 0).getDate();
-const from = `${y}-${mo}-01`, to = `${y}-${mo}-${pad(lastD)}`;
-const exp = _getExpenseTotalForRange(from, to);
-return m.total - 2 * exp; // gross - expense
+rawMonthLabels = monthGrossRaw.map(m => m.month);
+const filtered = monthGrossRaw.map(m => {
+const g = extractMonthVal(m);
+const e = biz ? (expMap[m.month] || 0) : 0;
+_trendGross += g;
+_trendExpense += e;
+return { month: m.month, net: g - e };
 });
+if (_trendGross === 0 && _trendExpense === 0) { showAnEmpty(); return; }
+labels = filtered.map(m => m.month.slice(5) + '月');
+data = filtered.map(m => m.net);
 unitLabel = '月別';
 }
 
-if (!data || data.length === 0 || data.every(v => v === 0)) { showAnEmpty(); return; }
+if (!data || data.length === 0) { showAnEmpty(); return; }
 
-// ── trendDatasets: 売上モード時は目標ラインを追加 ──
 const trendDatasets = (() => {
-const biz = isBizMode();
 const ds = [{
 label: biz ? '売上' : '支出',
 data,
@@ -3265,7 +3510,6 @@ const hist = JSON.parse(DB.getBudgetHistory(60));
 const fallback = parseInt(S.baseBudget) || 0;
 let targetData;
 if (gran === 'monthly') {
-// 月ごとに対応する予算を取得
 targetData = rawMonthLabels.map(ym => {
 const mid = ym + '-15';
 for (const bp of (hist || [])) {
@@ -3274,7 +3518,6 @@ if (bp.periodFrom <= mid && mid <= bp.periodTo) return bp.totalAmount;
 return fallback;
 });
 } else {
-// 日別/週別: 期間全体の予算をデータ数で按分
 let budgetVal = fallback;
 if (hist && hist.length && range.from && range.to) {
 let matched = false, sum = 0;
@@ -3285,10 +3528,7 @@ sum += bp.totalAmount; matched = true;
 }
 if (matched) budgetVal = sum;
 }
-const perPoint = gran === 'daily'
-? Math.round(budgetVal / (data.length || 30))
-: Math.round(budgetVal / 4.3);
-targetData = new Array(data.length).fill(perPoint);
+targetData = data.map((_, i) => Math.round(budgetVal * (i + 1) / data.length));
 }
 if (targetData && targetData.some(v => v > 0)) {
 ds.push({
@@ -3317,11 +3557,12 @@ datasets: trendDatasets
 options: {
 responsive: true,
 plugins: {
-legend: { display: isBizMode(), labels: { font: { size: 11 }, boxWidth: 20 } },
+legend: { display: biz, labels: { font: { size: 11 }, boxWidth: 20 } },
 tooltip: { callbacks: { label: ctx => {
-const v = '¥' + ctx.parsed.y.toLocaleString();
+const v = (ctx.parsed.y < 0 ? '−¥' : '¥') + Math.abs(ctx.parsed.y).toLocaleString();
 if (ctx.dataset.label === '目標') return '目標 ' + v;
-return (isBizMode() ? '売上' : '累計') + ' ' + v;
+const lbl = gran === 'monthly' ? (biz ? '純売上' : '月別') : (biz ? '累計純売上' : '累計');
+return lbl + ' ' + v;
 }}}
 },
 scales: {
@@ -3334,54 +3575,48 @@ font: { size: 10 }
 },
 y: {
 beginAtZero: true,
-ticks: { callback: v => '¥' + v.toLocaleString() }
+ticks: { callback: v => (v < 0 ? '−¥' : '¥') + Math.abs(v).toLocaleString() }
 }
 }
 }
 });
 
-// サマリー（累積グラフの場合は元データで計算）
 const sumSrc  = rawData || data;
 const total   = rawData ? data[data.length - 1] : data.reduce((s,v) => s + v, 0);
-const nonZero = sumSrc.filter(v => v > 0);
+const nonZero = sumSrc.filter(v => v !== 0);
 const avg     = nonZero.length > 0 ? Math.round(total / nonZero.length) : 0;
 const max     = Math.max(...sumSrc);
 const maxIdx  = sumSrc.indexOf(max);
 const maxLabel = labels[maxIdx] || '';
 
-// bizMode: 目標値を事前取得（fixedSubとtrendUnder両方で使う）
-// 複数月にまたがる場合は全予算期間を合算
 const _trendBudgetVal = (() => {
 if (!range.from || !range.to) return 0;
 try {
 const hist = JSON.parse(DB.getBudgetHistory(60));
 if (!hist || !hist.length) return parseInt(S.baseBudget) || 0;
-// range と重複する予算期間を全て合算（重複日数で按分せず全額加算）
-let total = 0, matched = false;
+let bTotal = 0, matched = false;
 for (const bp of hist) {
 if (bp.periodFrom <= range.to && bp.periodTo >= range.from) {
-total += bp.totalAmount;
+bTotal += bp.totalAmount;
 matched = true;
 }
 }
-if (matched) return total;
+if (matched) return bTotal;
 } catch(e) {}
 return parseInt(S.baseBudget) || 0;
 })();
-// 固定費（期間全体の合算：カテゴリ比率と同ロジック）
+
 const _trendFrom = range.from || getCurrentPeriod().from;
 const _trendTo   = range.to   || getCurrentPeriod().to;
 const fixedTotal = _anGetFixedTotalForRange(_trendFrom, _trendTo);
-const _trendBiz = isBizMode();
 const fixedSub  = (fixedTotal > 0 && anShowFixed && S.fixedOn)
 ? (() => {
-if (_trendBiz && S.fixedMode === 'ADD') {
-// 売上から減額モード：純売上 = 売上 - 固定費
-const net = Math.max(0, total - fixedTotal);
+if (biz && S.fixedMode !== 'BUDGET') {
+const net = total - fixedTotal;
 const _netColor = (_trendBudgetVal > 0 && net < _trendBudgetVal) ? 'color:#ef4444;font-weight:700;' : '';
-return `<div class="an-summary-item"><span class="an-summary-label">純売上</span><span class="an-summary-val" style="${_netColor}">¥${net.toLocaleString()}<span style="font-size:11px;color:#94a3b8;">（−¥${fixedTotal.toLocaleString()}）</span></span></div>`;
-} else if (_trendBiz && S.fixedMode === 'BUDGET') {
-// 予算に加算モード：目標 = 予算 + 固定費（サブ表示は参考のみ）
+const netStr = (net < 0 ? '−¥' : '¥') + Math.abs(net).toLocaleString();
+return `<div class="an-summary-item"><span class="an-summary-label">固定費控除後</span><span class="an-summary-val" style="${_netColor}">${netStr}<span style="font-size:11px;color:#94a3b8;">（−¥${fixedTotal.toLocaleString()}）</span></span></div>`;
+} else if (biz && S.fixedMode === 'BUDGET') {
 return `<div class="an-summary-item"><span class="an-summary-label">固定費（参考）</span><span class="an-summary-val">¥${fixedTotal.toLocaleString()}</span></div>`;
 } else {
 return `<div class="an-summary-item"><span class="an-summary-label">固定費込み</span><span class="an-summary-val">¥${(total + fixedTotal).toLocaleString()}<span style="font-size:11px;color:#94a3b8;">（+¥${fixedTotal.toLocaleString()}）</span></span></div>`;
@@ -3389,36 +3624,36 @@ return `<div class="an-summary-item"><span class="an-summary-label">固定費込
 })()
 : '';
 
-// 経費差し引き: gross = raw−経費エントリ除去, net = gross−経費控除
-const _trendExpense = isBizMode() ? _getExpenseTotalForRange(_trendFrom, _trendTo) : 0;
-const _trendGross  = isBizMode() ? total - _trendExpense : total; // 総売上
-const _netSales    = isBizMode() ? _trendGross - _trendExpense : total; // 純売上
-const _trendUnder  = isBizMode() && _trendBudgetVal > 0 && _netSales < _trendBudgetVal;
-const _totalColor = _trendUnder ? 'color:#ef4444;font-weight:700;' : '';
-// 目標達成情報（bizMode時のみ）
-const _expRow = (isBizMode() && _trendExpense > 0)
+const _netSales    = biz ? (_trendGross - _trendExpense) : total;
+const _trendUnder  = biz && _trendBudgetVal > 0 && _netSales < _trendBudgetVal;
+const _totalColor  = _trendUnder ? 'color:#ef4444;font-weight:700;' : '';
+const _expRow = (biz && _trendExpense > 0)
 ? `<div class="an-summary-item"><span class="an-summary-label">経費合計</span><span class="an-summary-val" style="color:#e17055;">¥${_trendExpense.toLocaleString()}</span></div>`
 : '';
-const _targetRow = isBizMode() && _trendBudgetVal > 0
+const _targetRow = biz && _trendBudgetVal > 0
 ? `<div class="an-summary-item"><span class="an-summary-label">目標</span><span class="an-summary-val" style="color:#6366f1;">¥${_trendBudgetVal.toLocaleString()}</span></div>`
 : '';
-const _rateRow = isBizMode() && _trendBudgetVal > 0
+const _rateRow = biz && _trendBudgetVal > 0
 ? (() => {
 const r = Math.round(_netSales / _trendBudgetVal * 100);
 const col = r >= 100 ? '#22c55e' : r >= 70 ? '#f39c12' : '#ef4444';
 return `<div class="an-summary-item"><span class="an-summary-label">達成率</span><span class="an-summary-val" style="color:${col};font-weight:700;">${r}%</span></div>`;
 })()
 : '';
+const fmtYen = v => (v < 0 ? '−¥' : '¥') + Math.abs(v).toLocaleString();
 document.getElementById('an-summary-content').innerHTML = `
+<div class="an-scroll-body" id="an-scroll-body">
 <div class="an-summary-grid">
-<div class="an-summary-item"><span class="an-summary-label">${isBizMode() ? '総売上' : '期間合計'}</span><span class="an-summary-val" style="${_totalColor}">¥${(isBizMode() ? _trendGross : total).toLocaleString()}</span></div>
+<div class="an-summary-item"><span class="an-summary-label">${biz ? '総売上' : '期間合計'}</span><span class="an-summary-val" style="${_totalColor}">${fmtYen(biz ? _trendGross : total)}</span></div>
 ${_expRow}
 ${_targetRow}
 ${_rateRow}
-<div class="an-summary-item"><span class="an-summary-label">${unitLabel}平均</span><span class="an-summary-val">¥${avg.toLocaleString()}</span></div>
-<div class="an-summary-item"><span class="an-summary-label">最高</span><span class="an-summary-val">${maxLabel} ¥${max.toLocaleString()}</span></div>
+<div class="an-summary-item"><span class="an-summary-label">${unitLabel}平均</span><span class="an-summary-val">${fmtYen(avg)}</span></div>
+<div class="an-summary-item"><span class="an-summary-label">最高</span><span class="an-summary-val">${_escHtml(maxLabel)} ${fmtYen(max)}</span></div>
 ${fixedSub}
+</div>
 </div>`;
+_fixSummaryScrollHeight();
 } catch(e) { console.error('renderTrendChart:', e); showAnEmpty(); }
 }
 
@@ -3427,15 +3662,14 @@ function renderCatChart() {
 try {
 destroyChart();
 const range  = getAnDateRange();
-const filter = JSON.stringify({ dateFrom: range.from, dateTo: range.to, tagIds: anTagIds, categoryIds: anCatIds, memo: anMemo });
-const raw    = JSON.parse(DB.getCategoryStats(filter));
-if (!raw || raw.length === 0) { showAnEmpty(); return; }
-
-// 0円カテゴリ除外
+const filter = JSON.stringify({
+dateFrom: range.from, dateTo: range.to,
+tagIds: anTagIds, categoryIds: anCatIds, memo: anMemo,
+excludeCostTags: isBizMode()
+});
+const raw    = JSON.parse(DB.getCategoryStats(filter) || '[]');
 let items = raw.filter(r => r.amount > 0);
-if (items.length === 0) { showAnEmpty(); return; }
 
-// 固定費カテゴリを追加（期間内の全月分を合算）
 const fixedTotal = _anGetFixedTotalForRange(
 range.from || getCurrentPeriod().from,
 range.to   || getCurrentPeriod().to
@@ -3443,14 +3677,14 @@ range.to   || getCurrentPeriod().to
 if (fixedTotal > 0 && anShowFixed && S.fixedOn) {
 items = [...items, { catName: '固定費', amount: fixedTotal, isFixed: true }];
 }
+if (items.length === 0) { showAnEmpty(); return; }
 
 const palette = ['#00b894','#0984e3','#fdcb6e','#e17055','#6c5ce7','#a29bfe','#fd79a8','#55efc4','#74b9ff','#fab1a0','#b2bec3'];
 const labels  = items.map(r => r.catName);
 const data    = items.map(r => r.amount);
-const colors  = items.map((r, i) => r.isFixed ? '#636e72' : palette[i % (palette.length - 1)]);
+const colors  = items.map((r, i) => r.isFixed ? '#636e72' : palette[i % palette.length]);
 const total   = data.reduce((s,v) => s + v, 0);
 
-_renderExpenseTrendToggle();
 const ctx = document.getElementById('an-canvas').getContext('2d');
 anChart = new Chart(ctx, {
 type: 'doughnut',
@@ -3485,7 +3719,7 @@ const col = colors[i];
 const fixedMark = r.isFixed ? ' <span style="font-size:10px;color:#94a3b8;">固定</span>' : '';
 return `<div class="an-cat-row">
 <span class="an-cat-dot" style="background:${col}"></span>
-<span class="an-cat-name">${r.catName}${fixedMark}</span>
+<span class="an-cat-name">${_escHtml(r.catName)}${fixedMark}</span>
 <span class="an-cat-pct">${pct}%</span>
 <span class="an-cat-amt">¥${r.amount.toLocaleString()}</span>
 </div>`;
@@ -3560,42 +3794,50 @@ const costTags = JSON.parse(DB.getMaster('cost_tags') || '[]');
 if (!costTags.length) {
 showAnEmpty();
 document.getElementById('an-summary-content').innerHTML =
-'<div style="padding:24px;text-align:center;color:#94a3b8;font-size:13px;">💡 経費タグを登録してください</div>';
+'<div class="an-scroll-body" id="an-scroll-body"><div style="padding:24px;text-align:center;color:#94a3b8;font-size:13px;">💡 経費タグを登録してください</div></div>';
+_fixSummaryScrollHeight();
 return;
 }
+_renderExpenseTrendToggle();
 const palette = ['#e17055','#fdcb6e','#6c5ce7','#00b894','#0984e3','#a29bfe','#fd79a8'];
-const tagMap = {};
-costTags.forEach(t => { tagMap[t.id] = t.name; });
 
-// 月別に各経費タグの金額を集計
 let months = [];
 if (range.from && range.to) {
-const pad = n => String(n).padStart(2,'0');
-let cur = new Date(range.from + 'T00:00:00');
-const end = new Date(range.to + 'T00:00:00');
-while (cur <= end) {
-const y = cur.getFullYear(), m = cur.getMonth();
-const from = `${y}-${pad(m+1)}-01`;
-const to = `${y}-${pad(m+1)}-${pad(new Date(y,m+1,0).getDate())}`;
-months.push({ label: `${m+1}月`, from, to });
-cur = new Date(y, m+1, 1);
+let cur = _parseYmd(range.from.slice(0, 7) + '-01');
+const end = _parseYmd(range.to.slice(0, 7) + '-01');
+let guard = 0;
+while (cur <= end && guard < 60) {
+const y = cur.getFullYear(), m = cur.getMonth() + 1;
+const from = `${y}-${_pad2(m)}-01`;
+const to = `${y}-${_pad2(m)}-${_pad2(_lastDayOfMonth(y, m))}`;
+months.push({ y, m, from, to });
+cur = new Date(y, m, 1);
+guard++;
 }
 } else {
-// ALL: 最近6ヶ月
+const startYm = S.appStartMonth ? S.appStartMonth.slice(0, 7) : '';
 for (let i = 5; i >= 0; i--) {
 const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - i);
-const y = d.getFullYear(), m = d.getMonth();
-const pad = n => String(n).padStart(2,'0');
-months.push({ label: `${m+1}月`, from: `${y}-${pad(m+1)}-01`,
-to: `${y}-${pad(m+1)}-${pad(new Date(y,m+1,0).getDate())}` });
+const y = d.getFullYear(), m = d.getMonth() + 1;
+const ym = `${y}-${_pad2(m)}`;
+if (startYm && ym < startYm) continue;
+months.push({ y, m, from: `${ym}-01`, to: `${ym}-${_pad2(_lastDayOfMonth(y, m))}` });
 }
 }
+months = months.map(mo => ({
+...mo,
+label: months.length > 11 ? `${mo.y}/${mo.m}月` : `${mo.m}月`
+}));
+if (!months.length) { showAnEmpty(); return; }
 
-// 各月・各タグの経費額を取得
-const datasets = costTags.slice(0, 7).map((tag, i) => {
+const shownTags = costTags.slice(0, 7);
+const datasets = shownTags.map((tag, i) => {
 const data = months.map(mo => {
 try {
-const f = JSON.stringify({ dateFrom: mo.from, dateTo: mo.to });
+const f = JSON.stringify({
+dateFrom: mo.from, dateTo: mo.to,
+categoryIds: anCatIds, tagIds: anTagIds, memo: anMemo
+});
 const raw = JSON.parse(DB.getCostTagStats(f) || '[]');
 const found = raw.find(r => Number(r.cardId) === Number(tag.id));
 return found ? (found.totalPrice || 0) : 0;
@@ -3632,12 +3874,12 @@ y: { ticks: { callback: v => '¥' + v.toLocaleString() }, beginAtZero: true }
 }
 });
 
-const rows = costTags.slice(0, 7).map((tag, i) => {
+const rows = shownTags.map((tag, i) => {
 const total = datasets[i].data.reduce((s, v) => s + v, 0);
 const pct = grandTotal > 0 ? Math.round(total / grandTotal * 100) : 0;
 return `<div class="an-cat-row">
 <span class="an-cat-dot" style="background:${palette[i % palette.length]}"></span>
-<span class="an-cat-name">${tag.name}</span>
+<span class="an-cat-name">${_escHtml(tag.name)}</span>
 <span class="an-cat-pct">${pct}%</span>
 <span class="an-cat-amt">¥${total.toLocaleString()}</span>
 </div>`;
@@ -3651,47 +3893,47 @@ _fixSummaryScrollHeight();
 }
 
 function renderExpenseTagChart() {
-// 推移モードへ分岐
-if (_expTrendMode === 'trend') { _renderExpenseTrendToggle(); renderExpenseTrendChart(); return; }
+if (_expTrendMode === 'trend') { renderExpenseTrendChart(); return; }
 try {
 destroyChart();
 const range  = getAnDateRange();
 const filter = JSON.stringify({ dateFrom: range.from, dateTo: range.to, categoryIds: anCatIds, tagIds: anTagIds, memo: anMemo });
 
-// expense_tags マスターをロード（id→name マップ）
 const expTags = JSON.parse(DB.getMaster('cost_tags') || '[]');
 const tagNameMap = {};
 expTags.forEach(t => { tagNameMap[t.id] = t.name; });
 
-// getCostTagStats で cost_tags マスターを参照した集計を取得
 const raw = JSON.parse(DB.getCostTagStats(filter));
 if (!raw || raw.length === 0) {
 if (expTags.length === 0) {
-// 経費タグ未設定
 showAnEmpty();
 document.getElementById('an-empty').style.display = 'none';
 document.getElementById('an-summary-content').innerHTML =
-'<div style="padding:24px;text-align:center;color:#94a3b8;font-size:13px;">'
-+ '💡 経費タグを登録して<br>記録に紐付けると経費比率が表示されます</div>';
+'<div class="an-scroll-body" id="an-scroll-body"><div style="padding:24px;text-align:center;color:#94a3b8;font-size:13px;">'
++ '💡 経費タグを登録して<br>記録に紐付けると経費比率が表示されます</div></div>';
+_fixSummaryScrollHeight();
 } else {
-_renderExpenseTrendToggle();
 showAnEmpty();
+_renderExpenseTrendToggle();
 }
 return;
 }
 
-// card_id から経費タグ名を解決（point_cards とのIDが被る可能性を考慮し、タグ名があれば優先）
 const items = raw.map(r => ({
 name: tagNameMap[r.cardId] || r.cardName || '不明',
 amount: r.totalPrice || 0,
 cardId: r.cardId
-})).filter(r => r.amount > 0);
+})).filter(r => r.amount > 0).sort((a, b) => b.amount - a.amount);
 
-// cardId がない場合（古いバージョン対応）→ cardName をそのまま使う
-if (items.length === 0) { showAnEmpty(); return; }
+if (items.length === 0) {
+showAnEmpty();
+if (expTags.length > 0) _renderExpenseTrendToggle();
+return;
+}
 
 const totalAmt = items.reduce((s, r) => s + r.amount, 0);
 const palette  = ['#e17055','#fdcb6e','#6c5ce7','#00b894','#0984e3','#a29bfe','#fd79a8'];
+const colors   = items.map((_, i) => palette[i % palette.length]);
 
 _renderExpenseTrendToggle();
 const ctx = document.getElementById('an-canvas').getContext('2d');
@@ -3701,7 +3943,7 @@ data: {
 labels: items.map(r => r.name),
 datasets: [{
 data: items.map(r => r.amount),
-backgroundColor: palette.slice(0, items.length),
+backgroundColor: colors,
 borderWidth: 2,
 }]
 },
@@ -3714,12 +3956,12 @@ tooltip: { callbacks: { label: ctx => ctx.label + ': ¥' + ctx.parsed.toLocaleSt
 }
 });
 
-const rows = items.sort((a,b) => b.amount - a.amount).map((r, i) => {
+const rows = items.map((r, i) => {
 const pct = totalAmt > 0 ? Math.round(r.amount / totalAmt * 100) : 0;
-const col = palette[i % palette.length];
+const col = colors[i];
 return `<div class="an-cat-row">
 <span class="an-cat-dot" style="background:${col}"></span>
-<span class="an-cat-name">${r.name}</span>
+<span class="an-cat-name">${_escHtml(r.name)}</span>
 <span class="an-cat-pct">${pct}%</span>
 <span class="an-cat-amt">¥${r.amount.toLocaleString()}</span>
 </div>`;
@@ -3757,7 +3999,7 @@ labels,
 datasets: [{
 label: '獲得ポイント',
 data,
-backgroundColor: palette.slice(0, data.length),
+backgroundColor: data.map((_, i) => palette[i % palette.length]),
 borderRadius: 6,
 }]
 },
@@ -3773,7 +4015,6 @@ y: { beginAtZero: true, ticks: { callback: v => v + 'pt' } }
 }
 });
 
-// サマリー（内訳トグルON時はカテゴリ展開）
 const toggleBtn = `<div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
 <div id="btn-pts-breakdown" class="srch-chip${anPtsBreakdown?' selected':''}"
 onclick="vibe();togglePtsBreakdown()" style="font-size:12px;padding:4px 12px;">
@@ -3790,7 +4031,7 @@ const otherPts = sorted.slice(5).reduce((s,b) => s + b.pts, 0);
 const bdRows = top5.map(b => {
 const pct = r.totalPts > 0 ? ((b.pts / r.totalPts) * 100).toFixed(0) : 0;
 return `<div class="an-pts-bd-row">
-<span class="an-pts-bd-cat">${b.catName}</span>
+<span class="an-pts-bd-cat">${_escHtml(b.catName)}</span>
 <span class="an-pts-bd-val">${b.pts.toLocaleString()}pt</span>
 <span class="an-pts-bd-pct">${pct}%</span>
 </div>`;
@@ -3805,7 +4046,7 @@ breakdownHtml = `<div class="an-pts-breakdown">${bdRows}${otherRow}</div>`;
 return `<div class="an-pts-card-row">
 <div class="an-cat-row">
 <span class="an-cat-dot" style="background:${col}"></span>
-<span class="an-cat-name">${r.cardName}</span>
+<span class="an-cat-name">${_escHtml(r.cardName)}</span>
 <span class="an-cat-pct">${r.totalPts.toLocaleString()}pt</span>
 <span class="an-cat-amt">¥${r.totalPrice.toLocaleString()}</span>
 </div>
@@ -3838,7 +4079,7 @@ const filter = JSON.stringify({ categoryIds: anCatIds, tagIds: anTagIds, memo: a
 // 3M以上 / ALL → 月別達成率グラフ
 const useDailyMode = (anPreset === 'MONTH' || anPreset === 'PREV_MONTH') ||
 (anPreset === 'CUSTOM' && range.from && range.to &&
-Math.round((new Date(range.to) - new Date(range.from)) / 86400000) + 1 <= 62);
+Math.round((_parseYmd(range.to) - _parseYmd(range.from)) / 86400000) + 1 <= 62);
 
 if (useDailyMode) {
 _renderBudgetDaily(range, filter);
@@ -3872,20 +4113,7 @@ return null;
 // useClosing: 締日連動フラグ
 function _anGetFixedForPeriod(periodFrom, periodTo, useClosing) {
 if (!anShowFixed || !S.fixedOn) return 0;
-let lookupDate;
-if (useClosing && periodFrom && periodTo) {
-// 過半数を占める月を特定
-const from  = new Date(periodFrom + 'T00:00:00');
-const to    = new Date(periodTo   + 'T00:00:00');
-const mid   = new Date((from.getTime() + to.getTime()) / 2);
-const pad   = n => String(n).padStart(2, '0');
-lookupDate  = `${mid.getFullYear()}-${pad(mid.getMonth()+1)}-01`;
-} else {
-// 表示開始月の月初を使用
-lookupDate = periodFrom
-? periodFrom.slice(0, 7) + '-01'
-: getCurrentPeriod().from;
-}
+const lookupDate = _getFixedLookupDate(periodFrom, periodTo, useClosing);
 try {
 const items = JSON.parse(DB.getFixedCostHistoryAt(lookupDate));
 return items.reduce((s, x) => s + x.amount, 0);
@@ -3896,7 +4124,6 @@ function _anFixedMode() {
 return (S.fixedMode === 'BUDGET') ? 'BUDGET' : 'ADD';
 }
 
-// 支出推移タブ・カテゴリタブ用（日付から最適な固定費月を推定）
 function _anGetFixedTotal(dateFrom) {
 if (!anShowFixed || !S.fixedOn) return 0;
 const useClosing = (anUseClosing !== null) ? anUseClosing : (S.closingOn === true || S.closingOn === 'true');
@@ -3904,44 +4131,29 @@ const p = getCurrentPeriod();
 return _anGetFixedForPeriod(dateFrom || p.from, p.to, useClosing);
 }
 
-// 複数月にまたがる期間の固定費を月数分合算して返す
 function _anGetFixedTotalForRange(fromStr, toStr) {
 if (!anShowFixed || !S.fixedOn || !fromStr || !toStr) return 0;
 const useClosing = (anUseClosing !== null) ? anUseClosing : (S.closingOn === true || S.closingOn === 'true');
-const pad = n => String(n).padStart(2, '0');
 
 if (useClosing && anPreset !== 'CUSTOM') {
-// 締日連動ON：fromStr〜toStr の中に含まれる締日期間を数えて × 1期分の固定費
-// 過半数月判定で固定費を1期分取得
-const periodFixed = _anGetFixedForPeriod(fromStr, toStr, true);
-// 期間数カウント：fromStr を起点に1期ずつ進めてtoStr以内に収まる数
-let nPeriods = 0;
-let curFrom = fromStr;
-// 最大36回（3年分）でガード
-for (let i = 0; i < 36; i++) {
-if (curFrom > toStr) break;
-nPeriods++;
-// 次期間の開始日 = 1ヶ月後の anchor+1 日
-const anchor  = parseInt(S.periodStartDay) || 25;
-const lastDay = (y, m) => new Date(y, m, 0).getDate();
-const d = new Date(curFrom + 'T00:00:00');
-let ny = d.getFullYear(), nm = d.getMonth() + 2; // 1ヶ月後
-if (nm > 12) { nm -= 12; ny++; }
-const nextFrom = ny + '-' + pad(nm) + '-' + pad(Math.min(anchor + 1, lastDay(ny, nm)));
-if (nextFrom === curFrom) break; // 無限ループ防止
-curFrom = nextFrom;
+const anchor = parseInt(S.periodStartDay) || 25;
+let cur = _calcClosingPeriodForDate(_parseYmd(fromStr), anchor);
+let total = 0;
+for (let i = 0; i < 60; i++) {
+if (cur.from > toStr) break;
+total += _anGetFixedForPeriod(cur.from, cur.to, true);
+cur = _calcNextClosingPeriod(cur.to, anchor);
 }
-return periodFixed * nPeriods;
+return total;
 }
 
-// 締日連動OFF / CUSTOM：カレンダー月ごとに合算
-const from = new Date(fromStr + 'T00:00:00');
-const to   = new Date(toStr   + 'T00:00:00');
+const from = _parseYmd(fromStr);
+const to   = _parseYmd(toStr);
 let total = 0;
 let y = from.getFullYear(), mo = from.getMonth() + 1;
 const endY = to.getFullYear(), endMo = to.getMonth() + 1;
 while (y < endY || (y === endY && mo <= endMo)) {
-const lookupDate = y + '-' + pad(mo) + '-01';
+const lookupDate = `${y}-${_pad2(mo)}-01`;
 try {
 const items = JSON.parse(DB.getFixedCostHistoryAt(lookupDate));
 total += items.reduce((s, x) => s + x.amount, 0);
@@ -3953,24 +4165,21 @@ return total;
 
 // ── 日別モード（当月/前月/指定62日以内）──
 function _renderBudgetDaily(range, filter) {
-const period     = getCurrentPeriod();
+const period      = getCurrentPeriod();
 const displayFrom = range.from || period.from;
 const displayTo   = range.to   || period.to;
+const _bDaily     = isBizMode();
 
-// --- 予算をgetBudgetHistoryで検索（getBudgetForPeriodはperiod_from完全一致のみなので使えない）---
 let budgetHistory = [];
 try { budgetHistory = JSON.parse(DB.getBudgetHistory(60)); } catch(e) {}
 
-// 表示期間と重なる予算期間を探す。
-// 優先順位：①displayFrom を含む期間 → ②displayFrom より前に始まる期間（直近）→ ③何でもいい重なり
 let found = null;
 for (const bp of budgetHistory) {
 if (bp.periodFrom <= displayFrom && bp.periodTo >= displayFrom) {
-found = bp; break;  // displayFrom を完全に含む → 最優先
+found = bp; break;
 }
 }
 if (!found) {
-// displayFrom より前に始まって displayTo 以前に終わる（部分重なり）
 for (const bp of budgetHistory) {
 if (bp.periodFrom <= displayTo && bp.periodTo >= displayFrom) {
 if (!found || bp.periodFrom > found.periodFrom) found = bp;
@@ -3982,48 +4191,70 @@ if (!found || found.totalAmount < 0) {
 showAnEmpty();
 document.getElementById('an-empty').style.display = 'block';
 document.getElementById('an-empty').innerText = 'この期間の予算が設定されていません。「予算・固定費管理」から設定してください。';
-document.getElementById('an-summary-content').innerHTML = '';
+document.getElementById('an-summary-content').innerHTML = '<div class="an-scroll-body" id="an-scroll-body"></div>';
+_fixSummaryScrollHeight();
 return;
 }
 
-const budgetAmount    = found.totalAmount;
+const budgetAmount     = found.totalAmount;
 const budgetPeriodFrom = found.periodFrom;
 const budgetPeriodTo   = found.periodTo;
 
-// 按分基準：予算期間の総日数
-const totalDays   = Math.round((new Date(budgetPeriodTo) - new Date(budgetPeriodFrom)) / 86400000) + 1;
-const dailyBudget = budgetAmount / totalDays;
+const useClosing = (anUseClosing !== null) ? anUseClosing : (S.closingOn === true || S.closingOn === 'true');
+const fixedTotal = _anGetFixedForPeriod(budgetPeriodFrom, budgetPeriodTo, useClosing);
+const fixedMode  = _anFixedMode();
+const showFixed  = fixedTotal > 0 && anShowFixed && S.fixedOn;
 
-// 表示開始日が予算期間内の何日目か（0始まり）。予算期間より前なら0扱い
+const effectiveBudget = (showFixed && fixedMode === 'BUDGET')
+? (_bDaily ? (budgetAmount + fixedTotal) : Math.max(0, budgetAmount - fixedTotal))
+: budgetAmount;
+const totalDays   = Math.max(1, Math.round((_parseYmd(budgetPeriodTo) - _parseYmd(budgetPeriodFrom)) / 86400000) + 1);
+const dailyBudget = effectiveBudget / totalDays;
+
 const displayOffsetDays = Math.max(0,
-Math.round((new Date(displayFrom) - new Date(budgetPeriodFrom)) / 86400000)
+Math.round((_parseYmd(displayFrom) - _parseYmd(budgetPeriodFrom)) / 86400000)
 );
 
-// ★ 表示範囲をそのまま使う（予算期間にクランプしない）
-const dailyRaw = JSON.parse(DB.getDailyStats(displayFrom, displayTo, filter));
-if (!dailyRaw.length) { showAnEmpty(); return; }
+const filterObj = JSON.parse(filter || '{}');
+const grossFilter = JSON.stringify(_bDaily ? Object.assign({}, filterObj, { excludeCostTags: true }) : filterObj);
+const dailyGross = JSON.parse(DB.getDailyStats(displayFrom, displayTo, grossFilter));
+if (!dailyGross.length) { showAnEmpty(); return; }
+const dailyExp = _bDaily
+? JSON.parse(DB.getDailyStats(displayFrom, displayTo, JSON.stringify(Object.assign({}, filterObj, { onlyCostTags: true }))))
+: [];
 
-// 累計ペース計算
-let cumSpent = 0;
-const paceData = [];
-const labels   = [];
+const dailyNet = dailyGross.map((d, i) => ({
+date: d.date,
+gross: d.total || 0,
+exp: _bDaily ? (dailyExp[i]?.total || 0) : 0,
+total: (d.total || 0) - (_bDaily ? (dailyExp[i]?.total || 0) : 0)
+}));
 
-dailyRaw.forEach((d, i) => {
+const fixedAddOffset = (showFixed && fixedMode === 'ADD')
+? (_bDaily ? -fixedTotal : fixedTotal)
+: 0;
+
+let cumSpent = fixedAddOffset;
+const cumSeries = [];
+const paceData  = [];
+const labels    = [];
+
+dailyNet.forEach((d, i) => {
 cumSpent += d.total;
+cumSeries.push(cumSpent);
 const elapsed   = displayOffsetDays + i + 1;
 const cumBudget = dailyBudget * elapsed;
 paceData.push(cumBudget > 0 ? Math.round((cumSpent / cumBudget) * 1000) / 10 : 100);
 
 const md = d.date.slice(5).replace('-', '/');
-const step = Math.ceil(dailyRaw.length / 10);
-labels.push(dailyRaw.length <= 14 || (i + 1) % step === 0 || i === 0 || i === dailyRaw.length - 1 ? md : '');
+const step = Math.ceil(dailyNet.length / 10);
+labels.push(dailyNet.length <= 14 || (i + 1) % step === 0 || i === 0 || i === dailyNet.length - 1 ? md : '');
 });
 
-const today    = new Date().toISOString().slice(0, 10);
-const todayIdx = dailyRaw.findIndex(d => d.date === today);
-const _dailyBiz = isBizMode();
-const pointColors  = paceData.map(v => _dailyBiz ? (v >= 100 ? '#22c55e' : v >= 70 ? '#f39c12' : '#ef4444') : (v > 100 ? '#ef4444' : '#22c55e'));
-const pointBorders = paceData.map(v => _dailyBiz ? (v >= 100 ? '#16a34a' : v >= 70 ? '#d68910' : '#dc2626') : (v > 100 ? '#dc2626' : '#16a34a'));
+const today    = _todayYmd();
+const todayIdx = dailyNet.findIndex(d => d.date === today);
+const pointColors  = paceData.map(v => _bDaily ? (v >= 100 ? '#22c55e' : v >= 70 ? '#f39c12' : '#ef4444') : (v > 100 ? '#ef4444' : '#22c55e'));
+const pointBorders = paceData.map(v => _bDaily ? (v >= 100 ? '#16a34a' : v >= 70 ? '#d68910' : '#dc2626') : (v > 100 ? '#dc2626' : '#16a34a'));
 
 const ctx = document.getElementById('an-canvas').getContext('2d');
 anChart = new Chart(ctx, {
@@ -4034,7 +4265,7 @@ datasets: [
 {
 label: '設定予算比率（%）',
 data: paceData,
-segment: { borderColor: ctx => _dailyBiz ? (paceData[ctx.p1DataIndex] >= 100 ? '#22c55e' : '#ef4444') : (paceData[ctx.p1DataIndex] > 100 ? '#ef4444' : '#22c55e') },
+segment: { borderColor: ctx => _bDaily ? (paceData[ctx.p1DataIndex] >= 100 ? '#22c55e' : '#ef4444') : (paceData[ctx.p1DataIndex] > 100 ? '#ef4444' : '#22c55e') },
 backgroundColor: 'transparent',
 pointBackgroundColor: pointColors,
 pointBorderColor:     pointBorders,
@@ -4062,18 +4293,19 @@ plugins: {
 legend: { display: false },
 tooltip: {
 callbacks: {
-title: items => dailyRaw[items[0].dataIndex]?.date || '',
+title: items => dailyNet[items[0].dataIndex]?.date || '',
 label: ctx => {
 if (ctx.datasetIndex === 1) return null;
 const i    = ctx.dataIndex;
-const cumS = dailyRaw.slice(0, i + 1).reduce((s, x) => s + x.total, 0);
+const cumS = cumSeries[i];
 const cumB = Math.round(dailyBudget * (displayOffsetDays + i + 1));
-const diff = cumB - cumS;
+const diff = _bDaily ? (cumS - cumB) : (cumB - cumS);
+const diffLbl = _bDaily ? (diff >= 0 ? '超過達成' : '未達') : (diff >= 0 ? '余裕' : '超過');
 return [
-(_dailyBiz ? ` 達成率: ${paceData[i]}%` : ` 消化ペース: ${paceData[i]}%`),
-(_dailyBiz ? ` 累計売上: ¥${cumS.toLocaleString()}` : ` 累計支出: ¥${cumS.toLocaleString()}`),
-` 按分予算: ¥${cumB.toLocaleString()}`,
-` ${diff >= 0 ? '余裕' : '超過'}: ${diff >= 0 ? '+' : '▲'} ¥${Math.abs(diff).toLocaleString()}`
+(_bDaily ? ` 達成率: ${paceData[i]}%` : ` 消化ペース: ${paceData[i]}%`),
+(_bDaily ? ` 累計純売上: ${cumS < 0 ? '−' : ''}¥${Math.abs(cumS).toLocaleString()}` : ` 累計支出: ¥${cumS.toLocaleString()}`),
+` 按分${_bDaily ? '目標' : '予算'}: ¥${cumB.toLocaleString()}`,
+` ${diffLbl}: ${diff >= 0 ? '+' : '▲'} ¥${Math.abs(diff).toLocaleString()}`
 ];
 }
 }
@@ -4089,18 +4321,13 @@ grid: { color: ctx => ctx.tick.value === 100 ? 'rgba(99,102,241,0.3)' : 'rgba(0,
 }
 });
 
-// サマリー
-const lastRate   = paceData[paceData.length - 1] || 0;
-const _rawCumSpentF = dailyRaw.reduce((s, d) => s + d.total, 0);
-const _dailyExpense  = isBizMode() ? _getExpenseTotalForRange(displayFrom, displayTo) : 0;
-// 総売上 = raw − 経費エントリ（経費はDBに正の数で記録されるため除去）
-const _grossSalesF  = isBizMode() ? _rawCumSpentF - _dailyExpense : _rawCumSpentF; // 総売上（マイナス許可）
-// 純売上 = 総売上 − 経費（控除）
-const cumSpentF = isBizMode() ? _grossSalesF - _dailyExpense : _rawCumSpentF; // 純売上（マイナス許可）
-const elapsed2   = displayOffsetDays + dailyRaw.length;
-const cumBudgetF = Math.round(dailyBudget * elapsed2);
-const _bDaily = isBizMode();
-// 達成率の色・ラベルを bizMode で反転
+const lastRate      = paceData[paceData.length - 1] || 0;
+const _grossSalesF  = dailyNet.reduce((s, d) => s + d.gross, 0);
+const _dailyExpense = _bDaily ? dailyNet.reduce((s, d) => s + d.exp, 0) : 0;
+const cumSpentF     = _bDaily ? (_grossSalesF - _dailyExpense) : _grossSalesF;
+const elapsed2      = displayOffsetDays + dailyNet.length;
+const cumBudgetF    = Math.round((budgetAmount / totalDays) * elapsed2);
+
 const rateClass = _bDaily
 ? (lastRate >= 100 ? 'ok' : lastRate >= 70 ? 'warn' : 'over')
 : (lastRate > 100 ? 'over' : lastRate > 90 ? 'warn' : 'ok');
@@ -4108,20 +4335,11 @@ const rateLabel = _bDaily
 ? (lastRate >= 100 ? '✅ 目標達成ペース' : lastRate >= 70 ? '⚡ やや未達' : '⚠️ 目標未達ペース')
 : (lastRate > 100 ? '⚠️ 予算超過ペース' : lastRate > 90 ? '⚡ やや注意' : '✅ 良いペース');
 
-// 固定費（月単位固定・日割りしない）
-const useClosing  = (anUseClosing !== null) ? anUseClosing : (S.closingOn === true || S.closingOn === 'true');
-const fixedTotal  = _anGetFixedForPeriod(budgetPeriodFrom, budgetPeriodTo, useClosing);
-const fixedMode   = _anFixedMode();
-const showFixed   = fixedTotal > 0 && anShowFixed && S.fixedOn;
-
 const bpLabel = `${budgetPeriodFrom.slice(5).replace('-','/')}〜${budgetPeriodTo.slice(5).replace('-','/')}（${totalDays}日間）`;
 
-// ── ADD モード：累計支出カードに固定費を追記 ──────────────────
-// ── BUDGET モード：余裕カードに控除後予算を表示 ───────────────
 let spentCardLabel = _bDaily ? '純売上' : '累計支出';
-let spentCardSub   = `按分${_bDaily ? '目標' : '予算'} ¥${cumBudgetF.toLocaleString()}`;
+let spentCardSub   = `按分${_bDaily ? '目標' : '予算'} ¥${Math.round(dailyBudget * elapsed2).toLocaleString()}`;
 let spentCardExtra = '';
-// bizMode: 総売上(純売上+経費) − 経費 表示
 if (_bDaily && _dailyExpense > 0) {
 spentCardExtra += `<div style="font-size:11px;color:#94a3b8;margin-top:2px;">総売上¥${_grossSalesF.toLocaleString()}−経費¥${_dailyExpense.toLocaleString()}</div>`;
 }
@@ -4135,36 +4353,32 @@ let marginSubText = _bDaily
 if (showFixed) {
 if (fixedMode === 'ADD') {
 if (_bDaily) {
-// 売上管理 ADD: 純売上 = 売上 - 固定費
-spentCardExtra = `<div style="font-size:12px;color:#64748b;margin-top:4px;">−¥${fixedTotal.toLocaleString()}<span style="font-size:10px;color:#94a3b8;">（固定費）</span></div>`;
-marginSpent = Math.max(0, cumSpentF - fixedTotal);
+spentCardExtra += `<div style="font-size:12px;color:#64748b;margin-top:4px;">−¥${fixedTotal.toLocaleString()}<span style="font-size:10px;color:#94a3b8;">（固定費）</span></div>`;
+marginSpent = cumSpentF - fixedTotal;
 } else {
-spentCardExtra = `<div style="font-size:12px;color:#64748b;margin-top:4px;">+¥${fixedTotal.toLocaleString()}<span style="font-size:10px;color:#94a3b8;">（固定費）</span></div>`;
+spentCardExtra += `<div style="font-size:12px;color:#64748b;margin-top:4px;">+¥${fixedTotal.toLocaleString()}<span style="font-size:10px;color:#94a3b8;">（固定費）</span></div>`;
 marginSpent = cumSpentF + fixedTotal;
 }
 } else {
 if (_bDaily) {
-// 売上管理 BUDGET: 目標 = 予算 + 固定費
 const netBudget = budgetAmount + fixedTotal;
-const netBudgetF = Math.round(netBudget / totalDays * elapsed2);
-marginBase = netBudgetF;
+marginBase = Math.round(netBudget / totalDays * elapsed2);
 marginSubText = `月目標 ¥${netBudget.toLocaleString()}（目標 ¥${budgetAmount.toLocaleString()}+固定費 ¥${fixedTotal.toLocaleString()}）`;
 } else {
 const netBudget = Math.max(0, budgetAmount - fixedTotal);
-const netBudgetF = Math.round(netBudget / totalDays * elapsed2);
-marginBase = netBudgetF;
+marginBase = Math.round(netBudget / totalDays * elapsed2);
 marginSubText = `月予算 ¥${netBudget.toLocaleString()}（予算 ¥${budgetAmount.toLocaleString()}−固定費 ¥${fixedTotal.toLocaleString()}）`;
 }
 }
 }
 
-// bizMode: diff = 売上 - 目標（プラスが達成超過）
 const diff      = _bDaily ? (marginSpent - marginBase) : (marginBase - marginSpent);
 const diffClass = diff >= 0 ? '#22c55e' : '#ef4444';
 const diffLabel = _bDaily ? (diff >= 0 ? '超過達成' : '未達') : (diff >= 0 ? '余裕' : '超過');
 const diffSign  = diff >= 0 ? '+' : '▲';
 
 document.getElementById('an-summary-content').innerHTML = `
+<div class="an-scroll-body" id="an-scroll-body">
 <div style="font-size:11px;color:#64748b;margin-bottom:8px;">${_bDaily ? '目標' : '予算'}期間: ${bpLabel}</div>
 <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
 <div class="bud-stat-card">
@@ -4174,7 +4388,7 @@ document.getElementById('an-summary-content').innerHTML = `
 </div>
 <div class="bud-stat-card">
 <div class="bud-stat-label">${spentCardLabel}</div>
-<div class="bud-stat-val" style="font-size:16px;font-weight:700;${(_bDaily && cumSpentF < 0) ? 'color:#ef4444;' : ''}">${cumSpentF < 0 ? '\u2212\u00a5' : '\u00a5'}${Math.abs(cumSpentF).toLocaleString()}</div>
+<div class="bud-stat-val" style="font-size:16px;font-weight:700;${(_bDaily && marginSpent < 0) ? 'color:#ef4444;' : ''}">${marginSpent < 0 ? '\u2212\u00a5' : '\u00a5'}${Math.abs(marginSpent).toLocaleString()}</div>
 ${spentCardExtra}
 <div class="bud-stat-sub">${spentCardSub}</div>
 </div>
@@ -4183,121 +4397,119 @@ ${spentCardExtra}
 <div class="bud-stat-val" style="font-size:16px;font-weight:700;color:${diffClass};">${diffSign} ¥${Math.abs(diff).toLocaleString()}</div>
 <div class="bud-stat-sub" style="font-size:10px;line-height:1.4;">${marginSubText}</div>
 </div>
+</div>
 </div>`;
+_fixSummaryScrollHeight();
 }
 
 function _renderBudgetMonthly(range, filter) {
-const pad     = n => String(n).padStart(2, '0');
-const lastDay = (y, m) => new Date(y, m, 0).getDate();
-
 const useClosing = (anUseClosing !== null)
 ? anUseClosing : (S.closingOn === true || S.closingOn === 'true');
+const _bmd = isBizMode();
+const anchor = parseInt(S.periodStartDay) || 25;
 
-// ── 期間リスト生成 ──────────────────────────────────────────
-// 締日連動ON（CUSTOM以外）: 締日期間を1つずつ列挙
-// 締日連動OFF / CUSTOM    : カレンダー月ごとに集計
-let periods = [];  // [{ from, to, label }]
+let periods = [];
 
 if (useClosing && anPreset !== 'CUSTOM') {
-// range.from から range.to まで締日期間で列挙
-const anchor = parseInt(S.periodStartDay) || 25;
-// curFrom の決定：空（ALL）なら最古記録日を含む締日期間の開始日から
-let curFrom = range.from;
-if (!curFrom) {
-// 最古記録日を含む締日期間の開始日を求める
-const earliest = _getEarliestRecordDate();
-curFrom = _snapToClosingPeriodStart(earliest, anchor);
-} else {
-// クランプで中途半端な日付になった場合も締日境界にスナップ
-curFrom = _snapToClosingPeriodStart(curFrom, anchor);
-}
-// range.to が空（ALL）の場合は現在の締日期間末を使う（today だと最終期間が途中で切れてラベルがズレる）
-const rangeEnd = range.to || getCurrentPeriod().to;
+let curStart = range.from
+? _snapToClosingPeriodStart(range.from, anchor)
+: _snapToClosingPeriodStart(_getEarliestRecordDate(), anchor);
+const rangeEnd = range.to || _calcClosingPeriodForDate(new Date(), anchor).to;
+let cp = _calcClosingPeriodForDate(_parseYmd(curStart), anchor);
 for (let guard = 0; guard < 60; guard++) {
-if (curFrom > rangeEnd) break;
-// 次期間の終了日 = curFrom の翌月の anchor 日
-const d  = new Date(curFrom + 'T00:00:00');
-let ny = d.getFullYear(), nm = d.getMonth() + 2; // getMonth() は 0-indexed → +2 で翌月
-if (nm > 12) { nm -= 12; ny++; }
-const periodTo = ny + '-' + pad(nm) + '-' + pad(Math.min(anchor, lastDay(ny, nm)));
-const actualTo = periodTo <= rangeEnd ? periodTo : rangeEnd;
-const midMs = (new Date(curFrom + 'T00:00:00').getTime() + new Date(actualTo + 'T00:00:00').getTime()) / 2;
-const mid   = new Date(midMs);
-const label = String(mid.getMonth()+1).padStart(2,'0') + '月';
-periods.push({ from: curFrom, to: actualTo, label });
-// 次期間の開始日 = periodTo の翌日 = 同じ ny/nm 月の anchor+1 日
-curFrom = ny + '-' + pad(nm) + '-' + pad(Math.min(anchor + 1, lastDay(ny, nm)));
+if (cp.from > rangeEnd) break;
+const actualTo = cp.to <= rangeEnd ? cp.to : rangeEnd;
+const labelRef = anchor >= 15 ? _parseYmd(cp.to) : _parseYmd(cp.from);
+const label = _pad2(labelRef.getMonth() + 1) + '月';
+periods.push({
+from: cp.from, to: actualTo,
+fullFrom: cp.from, fullTo: cp.to,
+label, labelYear: labelRef.getFullYear()
+});
 if (actualTo >= rangeEnd) break;
+cp = _calcNextClosingPeriod(cp.to, anchor);
 }
 } else {
-// カレンダー月ごとに列挙
-const from = range.from || '2020-01-01';
-const _now = new Date();
-const _curMonthEnd = _now.getFullYear() + '-' + String(_now.getMonth()+1).padStart(2,'0') + '-' + String(new Date(_now.getFullYear(), _now.getMonth()+1, 0).getDate()).padStart(2,'0');
-const to   = range.to   || _curMonthEnd;
-let y  = parseInt(from.slice(0, 4)), mo = parseInt(from.slice(5, 7));
+const from = range.from || _getEarliestRecordDate();
+const now = new Date();
+const curMonthEnd = `${now.getFullYear()}-${_pad2(now.getMonth()+1)}-${_pad2(_lastDayOfMonth(now.getFullYear(), now.getMonth()+1))}`;
+const to = range.to || curMonthEnd;
+let y = parseInt(from.slice(0, 4)), mo = parseInt(from.slice(5, 7));
 const endY = parseInt(to.slice(0, 4)), endMo = parseInt(to.slice(5, 7));
 for (let guard = 0; guard < 60; guard++) {
 if (y > endY || (y === endY && mo > endMo)) break;
-const monthEnd = lastDay(y, mo);
-const periodFrom = y + '-' + pad(mo) + '-01';
-const periodTo   = y + '-' + pad(mo) + '-' + pad(monthEnd);
+const monthEnd = _lastDayOfMonth(y, mo);
+const periodFrom = `${y}-${_pad2(mo)}-01`;
+const periodTo   = `${y}-${_pad2(mo)}-${_pad2(monthEnd)}`;
 const actualFrom = periodFrom > from ? periodFrom : from;
 const actualTo   = periodTo   < to   ? periodTo   : to;
-periods.push({ from: actualFrom, to: actualTo, label: String(mo).padStart(2,'0') + '月' });
+periods.push({
+from: actualFrom, to: actualTo,
+fullFrom: periodFrom, fullTo: periodTo,
+label: _pad2(mo) + '月', labelYear: y
+});
 mo++; if (mo > 12) { mo = 1; y++; }
 }
 }
 
 if (!periods.length) { showAnEmpty(); return; }
 
-// ── 各期間の実支出を getDailyStats で集計 ─────────────────
 let budgetHistory = [];
 try { budgetHistory = JSON.parse(DB.getBudgetHistory(60)); } catch(e) {}
 
-const fixedMode  = _anFixedMode();
-const showFixed  = anShowFixed && S.fixedOn;
+const fixedMode = _anFixedMode();
+const showFixed = anShowFixed && S.fixedOn;
+const filterObj = JSON.parse(filter || '{}');
+const grossFilter = JSON.stringify(_bmd ? Object.assign({}, filterObj, { excludeCostTags: true }) : filterObj);
+const expFilter   = JSON.stringify(Object.assign({}, filterObj, { onlyCostTags: true }));
 
 const months2 = periods.map(period => {
-// 支出集計（bizMode: expense_tags の金額を差し引いて純売上にする）
-let _rawSpent = 0;
+let _grossSpent = 0, _expAmt = 0;
 try {
-const daily = JSON.parse(DB.getDailyStats(period.from, period.to, filter));
-_rawSpent = daily.reduce((s, d) => s + (d.total || 0), 0);
+const dailyG = JSON.parse(DB.getDailyStats(period.from, period.to, grossFilter));
+_grossSpent = dailyG.reduce((s, d) => s + (d.total || 0), 0);
+if (_bmd) {
+const dailyE = JSON.parse(DB.getDailyStats(period.from, period.to, expFilter));
+_expAmt = dailyE.reduce((s, d) => s + (d.total || 0), 0);
+}
 } catch(e) {}
-const _expAmt = isBizMode() ? _getExpenseTotalForRange(period.from, period.to) : 0;
-// 総売上 = raw − 経費エントリ（DBに正の数で記録されているため除去）
-const _grossSpent = isBizMode() ? Math.max(0, _rawSpent - _expAmt) : _rawSpent;
-// 純売上 = 総売上 − 経費控除
-const spent = isBizMode() ? _grossSpent - _expAmt : _rawSpent; // マイナス許可
+const _rawSpent = _grossSpent + _expAmt;
+const spent = _bmd ? (_grossSpent - _expAmt) : _grossSpent;
 
-// 予算照合：期間の中央日が含まれる予算期間を優先
-const midStr  = period.from.slice(0, 7) + '-15';
+const midDate = new Date((_parseYmd(period.fullFrom || period.from).getTime() + _parseYmd(period.fullTo || period.to).getTime()) / 2);
+const midStr = _ymd(midDate);
 let budget = -1;
 for (const bp of budgetHistory) {
-if (bp.periodFrom <= midStr   && midStr   <= bp.periodTo) { budget = bp.totalAmount; break; }
+if (bp.periodFrom === period.from) { budget = bp.totalAmount; break; }
+}
+if (budget < 0) {
+for (const bp of budgetHistory) {
+if (bp.periodFrom <= midStr && midStr <= bp.periodTo) { budget = bp.totalAmount; break; }
+}
+}
+if (budget < 0) {
+for (const bp of budgetHistory) {
 if (bp.periodFrom <= period.from && period.from <= bp.periodTo) { budget = bp.totalAmount; break; }
 if (bp.periodFrom.slice(0, 7) === period.from.slice(0, 7)) { budget = bp.totalAmount; break; }
 }
-
-// 固定費
-let fixedAmt = 0;
-if (showFixed) {
-fixedAmt = _anGetFixedForPeriod(period.from, period.to, useClosing);
 }
 
-const _bmd = isBizMode();
+let fixedAmt = 0;
+if (showFixed) {
+fixedAmt = _anGetFixedForPeriod(period.fullFrom || period.from, period.fullTo || period.to, useClosing);
+}
+
 const effBudget = (fixedMode === 'BUDGET' && budget > 0)
 ? (_bmd ? Math.max(0, budget + fixedAmt) : Math.max(0, budget - fixedAmt))
 : budget;
-const effSpent  = (fixedMode === 'ADD')
-? (_bmd ? spent - fixedAmt : spent + fixedAmt) // マイナス許可
+const effSpent = (fixedMode === 'ADD')
+? (_bmd ? spent - fixedAmt : spent + fixedAmt)
 : spent;
-// bizMode: diff = 売上 - 予算（プラスが達成超過）
-const effDiff   = effBudget > 0 ? (_bmd ? effSpent - effBudget : effBudget - effSpent) : null;
-const effRate   = effBudget > 0 ? Math.round((effSpent / effBudget) * 100) : null;
+const effDiff = effBudget > 0 ? (_bmd ? effSpent - effBudget : effBudget - effSpent) : null;
+const effRate = effBudget > 0 ? Math.round((effSpent / effBudget) * 100) : null;
 return {
 label: period.label,
+labelYear: period.labelYear,
 from: period.from, to: period.to,
 budget, spent, fixedAmt,
 rawSpent: _rawSpent, grossSpent: _grossSpent, expenseAmt: _expAmt,
@@ -4306,10 +4518,9 @@ effOver: effBudget > 0 && (_bmd ? effSpent < effBudget : effSpent > effBudget)
 };
 });
 
-if (!months2.some(m => m.spent > 0 || m.budget > 0)) { showAnEmpty(); return; }
+if (!months2.some(m => m.spent !== 0 || m.rawSpent > 0 || m.budget > 0)) { showAnEmpty(); return; }
 
-// 全月を表示（グレーアウト）、集計は除外フィルタ適用
-const displayMonths = months2;  // 常に全月表示
+const displayMonths = months2;
 const calcMonths    = anHideNoBudget
 ? months2.filter(m => m.budget > 0)
 : months2;
@@ -4431,8 +4642,7 @@ return year + '年';
 
 let _prevYear = null;
 const rows = displayMonths.map(m => {
-// 締日連動ON時は from が前月になるため to の年を基準にする
-const _mYear = m.to ? parseInt(m.to.slice(0, 4)) : (m.from ? parseInt(m.from.slice(0, 4)) : null);
+const _mYear = m.labelYear != null ? m.labelYear : (m.to ? parseInt(m.to.slice(0, 4)) : (m.from ? parseInt(m.from.slice(0, 4)) : null));
 let yearHeaderHtml = '';
 if (_needYearHeader && _mYear !== null && _mYear !== _prevYear) {
 yearHeaderHtml =
@@ -4546,7 +4756,7 @@ const _t2 =
 + '<tbody><tr style="background:#f1f5f9;">'
 + '<td class="bud-td" style="font-weight:700;">合計</td>'
 + '<td class="bud-td">' + (totalBudget > 0 ? '\u00a5' + totalBudget.toLocaleString() : '\u2014') + '</td>'
-+ '<td class="bud-td" style="font-weight:700;">\u00a5' + totalSpent.toLocaleString() + '</td>'
++ '<td class="bud-td" style="font-weight:700;' + (totalSpent < 0 ? 'color:#ef4444;' : '') + '">' + (totalSpent < 0 ? '\u2212\u00a5' : '\u00a5') + Math.abs(totalSpent).toLocaleString() + '</td>'
 + '<td class="bud-td">' + totalDiff + '</td>'
 + '<td class="bud-td">' + totalRateHtml + '</td>'
 + '</tr></tbody></table></div>';

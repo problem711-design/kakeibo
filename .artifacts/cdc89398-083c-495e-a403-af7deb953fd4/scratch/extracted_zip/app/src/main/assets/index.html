@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<link rel="stylesheet" href="style.css?v=1772426223">
+<script src="js/chart.min.js"></script>
+</head>
+<body>
+<div id="app-modal"><div class="modal-box"><h3 id="modal-title"></h3><div id="modal-body"></div><div class="modal-btns"><button class="m-btn m-cancel" onclick="closeModal()">キャンセル</button><button class="m-btn m-ok" id="modal-ok">OK</button></div></div></div>
+
+
+<!-- ===== 検索・並べ替えモーダル ===== -->
+<div id="search-modal">
+<div class="srch-box">
+<div class="srch-header">
+<span id="srch-title">保存履歴を絞り込む</span>
+<button class="srch-close" onclick="vibe();closeSearch()">✕</button>
+</div>
+<div class="srch-body">
+
+<!-- カテゴリ -->
+<div class="srch-section">
+<div class="srch-label">カテゴリ <span class="srch-hint">（複数選択可）</span></div>
+<div id="srch-cat-area" class="srch-chip-area"></div>
+</div>
+
+<!-- タグ -->
+<div class="srch-section">
+<div class="srch-label">タグ <span class="srch-hint">（複数選択可）</span></div>
+<div id="srch-tag-area" class="srch-chip-area"></div>
+</div>
+
+<!-- メモ -->
+<div class="srch-section">
+<div class="srch-label">メモ <span class="srch-hint">（部分一致）</span></div>
+<input type="text" id="srch-memo" placeholder="キーワードを入力" class="srch-input">
+</div>
+
+<!-- カード -->
+<div class="srch-section">
+<div class="srch-label">使用カード <span class="srch-hint">（複数選択可）</span></div>
+<div id="srch-card-area" class="srch-chip-area"></div>
+</div>
+
+<!-- 期間プリセット -->
+<div class="srch-section">
+<div class="srch-label">期間</div>
+<div class="srch-period-row" id="srch-preset-area">
+<div class="srch-period-chip selected" data-v="ALL"   onclick="vibe();setSrchPreset('ALL')">全期間</div>
+<div class="srch-period-chip" data-v="MONTH"         onclick="vibe();setSrchPreset('MONTH')">当月</div>
+<div class="srch-period-chip" data-v="PREV_MONTH"    onclick="vibe();setSrchPreset('PREV_MONTH')">前月</div>
+<div class="srch-period-chip" data-v="3M"            onclick="vibe();setSrchPreset('3M')">3ヶ月</div>
+<div class="srch-period-chip" data-v="6M"            onclick="vibe();setSrchPreset('6M')">半年</div>
+<div class="srch-period-chip" data-v="1Y"            onclick="vibe();setSrchPreset('1Y')">1年</div>
+</div>
+</div>
+
+<!-- 期間カスタム -->
+<div class="srch-section">
+<div class="srch-check-row" onclick="vibe();toggleSrchCustomPeriod()">
+<div class="custom-check" id="srch-chk-custom"></div>
+<span>期間を直接指定する（上のプリセットより優先）</span>
+</div>
+<div id="srch-custom-period" style="display:none; margin-top:8px;">
+<div class="srch-date-row">
+<input type="date" id="srch-date-from" class="srch-date-input">
+<span class="srch-date-sep">〜</span>
+<input type="date" id="srch-date-to"   class="srch-date-input">
+</div>
+</div>
+</div>
+
+<!-- ソート -->
+<div class="srch-section">
+<div class="srch-check-row" onclick="vibe();toggleSrchSort()">
+<div class="custom-check" id="srch-chk-sort"></div>
+<span>並べ替え条件を詳細設定する（未設定：支出日の新しい順）</span>
+</div>
+<div id="srch-sort-area" style="display:none; margin-top:10px;">
+<div class="srch-label" style="margin-bottom:6px;">ソート条件を追加 <span class="srch-hint">（上から優先・最大4件・重複不可）</span></div>
+<!-- 追加ボタン行 -->
+<div class="srch-sort-add-row" id="srch-sort-add-row">
+<div class="srch-sort-field-btn" data-f="date"    onclick="vibe();addSort('date')">支出日</div>
+<div class="srch-sort-field-btn" data-f="price"   onclick="vibe();addSort('price')">支出額</div>
+<div class="srch-sort-field-btn" data-f="created" onclick="vibe();addSort('created')">登録日</div>
+<div class="srch-sort-field-btn" data-f="points"  onclick="vibe();addSort('points')">獲得Pt</div>
+</div>
+<!-- 選択済みソート条件リスト -->
+<div id="srch-sort-list"></div>
+</div>
+</div>
+
+</div>
+<!-- 実行・リセット -->
+<div class="srch-footer">
+<button class="srch-reset-btn" onclick="vibe();resetSearch()">リセット</button>
+<button class="srch-exec-btn"  onclick="vibe();execSearch()">この条件で表示</button>
+</div>
+</div>
+</div>
+
+<div class="header">
+<span class="header-left">KAKEIBO PRO</span>
+<!-- アカウントドロップダウントリガー -->
+<div id="acct-trigger" class="acct-trigger" onclick="vibe();toggleAcctDropdown()">
+<span id="acct-label">アカウント1</span>
+<span class="acct-arrow" id="acct-arrow">▼</span>
+</div>
+<span id="select-count" style="font-size:11px"></span>
+</div>
+<!-- アカウントドロップダウンメニュー -->
+<div id="acct-dropdown" class="acct-dropdown" style="display:none;">
+<div class="acct-dd-inner" id="acct-dd-inner">
+<!-- JS で生成 -->
+</div>
+</div>
+
+<!-- ===== 入力タブ ===== -->
+<div id="view-input" class="container">
+
+<div class="section-card">
+<div class="input-label">金額 <span class="edit-link" id="card-edit-link" onclick="vibe();openCardOrExpenseEdit()">カード編集</span></div>
+<div class="amt-wrapper">
+<input type="number" id="amount" placeholder="¥ 0">
+<button id="cardBtn" class="card-toggle" onclick="vibe();toggleCardUse()">CARD</button>
+</div>
+<div id="pointSection" style="display:none; margin-top:8px;">
+<div class="input-label" id="card-area-label" style="margin-bottom:4px;">使用カード</div>
+<div id="cardArea" class="tag-container"></div>
+<div id="points-input-wrap"><input type="number" id="points" placeholder="獲得ポイント" style="margin-top:8px;width:100%;"></div>
+</div>
+</div>
+
+<div class="section-card">
+<div class="input-label" style="display:flex;justify-content:space-between;align-items:center;"><span>カテゴリ <span class="edit-link" onclick="vibe();openMasterEdit('categories')">カテゴリ編集</span></span><button id="fold-cat" onclick="vibe();toggleInputSection('categoryGrid','fold-cat')" style="background:none;border:1px solid #e2e8f0;border-radius:8px;padding:2px 8px;font-size:13px;color:#94a3b8;line-height:1.5;">▲</button></div>
+<div class="grid" id="categoryGrid"></div>
+</div>
+
+<div class="section-card">
+<div class="memo-header">
+<div class="input-label" style="margin:0;display:flex;justify-content:space-between;align-items:center;flex:1;"><span>メモ &amp; タグ <span class="edit-link" onclick="vibe();openMasterEdit('custom_tags')">タグ編集</span></span><button id="fold-tag" onclick="vibe();toggleInputSection('tagArea','fold-tag')" style="background:none;border:1px solid #e2e8f0;border-radius:8px;padding:2px 8px;font-size:13px;color:#94a3b8;line-height:1.5;">▲</button></div>
+<button class="memo-toggle-btn" id="memoToggleBtn" onclick="vibe();toggleMemo()">メモ ＋</button>
+</div>
+<div id="memoArea" style="display:none; margin-top:8px;">
+<input type="text" id="itemName" placeholder="メモを入力">
+</div>
+<div id="tagArea" class="tag-container" style="margin-top:6px;"></div>
+</div>
+
+<!-- ===== 入力タブ インフォパネル（ランキング・比較・ポイント） ===== -->
+<div id="input-info-panel" style="display:none;">
+<!-- ランキングブロック -->
+<div id="info-ranking-block" style="display:none;" class="info-block">
+<div class="info-block-title" id="info-ranking-title">今期 支出ランキング TOP3</div>
+<div id="info-ranking-list"></div>
+</div>
+<!-- 前期間比較ブロック -->
+<div id="info-compare-block" style="display:none;" class="info-block">
+<div class="info-block-title" id="info-compare-title">前期間比較</div>
+<div id="info-compare-list"></div>
+</div>
+<!-- ポイントブロック -->
+<div id="info-points-block" style="display:none;" class="info-block">
+<div class="info-block-title" id="info-pts-block-title">今期 獲得ポイント</div>
+<div id="info-points-list"></div>
+</div>
+</div>
+
+<div class="bottom-floating-area" id="float-input">
+<div class="summary-container" id="summary-container">
+<div class="summary-period-label" id="summary-period-label">今月の支出</div>
+<!-- 予算未設定警告（EXP以外で予算0の時に表示） -->
+<div id="summary-no-budget" style="display:none;" class="summary-no-budget">
+⚠️ 基本月予算が未設定です<br>
+<span>設定5「予算・固定費の管理」で設定してください</span>
+</div>
+<!-- 支出額（EXP / BOTH時に表示） -->
+<div class="summary-value" id="summary-total">¥ 0</div>
+<!-- 予算残高バー（BOTH / REMAIN時に表示） -->
+<div class="summary-budget-row" id="summary-budget-row" style="display:none;">
+<div class="summary-budget-top">
+<span class="summary-budget-label" id="summary-budget-label">予算残り</span>
+<span class="summary-budget-remain" id="summary-budget-remain">¥ 0</span>
+<span class="summary-budget-of" id="summary-budget-of"></span>
+</div>
+<div class="summary-bar-wrap">
+<div class="summary-bar-fill" id="summary-bar-fill"></div>
+</div>
+</div>
+<!-- 固定費サブ表示 -->
+<div class="summary-fixed-sub" id="summary-fixed-sub" style="display:none;">
+<span class="summary-fixed-label">うち固定費</span>
+<span class="summary-fixed-val" id="summary-fixed-val">¥ 0</span>
+</div>
+</div>
+<div class="fab-col">
+<div class="date-chip" id="dateChip" onclick="vibe();openDatePicker()">
+📅 <span id="dateLabel">--/--</span>
+</div>
+<input type="date" id="date" style="display:none;" onchange="onDateChange()">
+<button class="fab-new" id="save-btn" onclick="vibe();saveData()">保存</button>
+</div>
+</div>
+</div>
+
+<!-- ===== 履歴タブ ===== -->
+<div id="view-history" class="container" style="display:none;">
+<div class="hist-tabs">
+<div class="history-tab active" id="tab-save" onclick="vibe();subTab('SAVE')">保存履歴</div>
+<div class="history-tab" id="tab-delete" onclick="vibe();subTab('DELETE')">削除履歴</div>
+<div class="history-tab srch-tab-btn" id="tab-search" onclick="vibe();openSearch()">🔍 絞込</div>
+</div>
+<!-- 検索中バナー -->
+<div id="srch-active-bar" style="display:none;" class="srch-active-bar">
+<div class="srch-active-inner">
+<div id="srch-active-chips" class="srch-active-chips"></div>
+<button onclick="vibe();clearSearch()" class="srch-clear-btn">クリア ✕</button>
+</div>
+</div>
+<div id="displayArea"></div>
+<button id="loadMoreBtn" class="more-btn" onclick="vibe();loadMore()">続きを表示</button>
+
+</div>
+
+<!-- ===== 設定タブ ===== -->
+<div id="view-settings" class="container" style="display:none;">
+
+<div class="section-card">
+<div class="s-num-label"><span class="s-num">1</span>表示モード</div>
+<div class="radio-group">
+<label class="radio-opt" onclick="vibe();setDisplayMode('SIMPLE')">
+<div class="radio-circle" id="dot-mode-SIMPLE"></div>
+<div><div class="radio-title">簡易モード</div><div class="radio-desc">支出額・残予算をコンパクトに表示</div></div>
+</label>
+<label class="radio-opt" onclick="vibe();setDisplayMode('DETAIL')">
+<div class="radio-circle" id="dot-mode-DETAIL"></div>
+<div><div class="radio-title">詳細モード</div><div class="radio-desc">カテゴリ・対比・ポイントを詳しく表示</div></div>
+</label>
+</div>
+</div>
+
+<div class="section-card">
+<div class="s-num-label"><span class="s-num">2</span>期間・内容設定</div>
+<div class="setting-row">
+<span>表示形式</span>
+<select id="set-biz-mode" onchange="vibe();onBizModeChange()">
+<option value="false">支出管理</option>
+<option value="true">売上管理</option>
+</select>
+</div>
+<div class="setting-row">
+<span>表示期間</span>
+<select id="set-period-unit" onchange="vibe();onSettingSelectChange('set-period-unit')">
+<option value="WEEK">今週</option>
+<option value="MONTH" selected>今月</option>
+<option value="YEAR">今年</option>
+<option value="SEASON">シーズン</option>
+</select>
+</div>
+<div id="row-season-preset" class="setting-row" style="display:none;">
+<span>シーズン定義</span>
+<select id="set-season-type" onchange="vibe();onSettingSelectChange(this.id)">
+<option value="Q">四半期</option>
+<option value="H">半期（上半期／下半期）</option>
+<option value="FY">年度（4月〜翌3月）</option>
+</select>
+</div>
+<div class="setting-row">
+<span>表示内容</span>
+<select id="set-simple-view" onchange="vibe();onSettingSelectChange(this.id)">
+<option value="EXP" selected>支出額のみ</option>
+<option value="REMAIN">残予算のみ</option>
+<option value="BOTH">支出額 &amp; 残予算</option>
+</select>
+</div>
+<div class="s-hr"></div>
+<div class="setting-row">
+<span id="toggle-points-label">獲得ポイントを表示</span>
+<div class="toggle-wrap" id="toggle-points" onclick="vibe();toggleSwitch('toggle-points','group-points-opts')"><div class="toggle-knob"></div></div>
+</div>
+<div id="group-points-opts" style="display:none;">
+<div class="s-sub-label" style="margin-top:4px;">表示内容</div>
+<div class="radio-group radio-group-sm">
+<label class="radio-opt radio-opt-sm" onclick="vibe();setPointsMode('TOP3')">
+<div class="radio-circle radio-circle-sm" id="dot-pts-TOP3"></div>
+<span id="pts-opt-top3">獲得ポイント トップ3</span>
+</label>
+<label class="radio-opt radio-opt-sm" onclick="vibe();setPointsMode('SELECT')">
+<div class="radio-circle radio-circle-sm" id="dot-pts-SELECT"></div>
+<span id="pts-opt-select">カードタグから選択（3つまで）</span>
+</label>
+</div>
+<div id="group-pts-card-select" style="display:none; margin-top:8px;">
+<div class="s-sub-label" id="pts-card-select-label">表示するカードを選択</div>
+<div id="pts-card-area" class="tag-container"></div>
+</div>
+</div>
+</div>
+
+<div id="group-detail-settings" style="display:none;">
+<div class="section-card">
+<div class="s-num-label"><span class="s-num">3</span>詳細モード設定</div>
+<div class="check-row" onclick="vibe();toggleDetailCheck('check-ranking')">
+<div class="custom-check" id="check-ranking"></div>
+<span>ランキングを表示する</span>
+</div>
+<div id="group-ranking" style="display:none;">
+<div class="s-sub-label" style="margin-left:30px;">対象</div>
+<div class="tag-container" style="margin-left:30px; margin-bottom:10px;">
+<div class="tag sel-btn" id="btn-rank-category" onclick="vibe();toggleSelBtn('rank','category')">カテゴリ</div>
+<div class="tag sel-btn" id="btn-rank-tag" onclick="vibe();toggleSelBtn('rank','tag')">タグ</div>
+</div>
+<div class="s-sub-label" style="margin-left:30px;">トップの基準</div>
+<div class="radio-group radio-group-sm" style="margin-left:30px; margin-bottom:8px;">
+<label class="radio-opt radio-opt-sm" onclick="vibe();setRadioSm('rank-order','HIGH')">
+<div class="radio-circle radio-circle-sm" id="dot-rank-order-HIGH"></div>
+<span>支出額の多い順をトップとして扱う</span>
+</label>
+<label class="radio-opt radio-opt-sm" onclick="vibe();setRadioSm('rank-order','LOW')">
+<div class="radio-circle radio-circle-sm" id="dot-rank-order-LOW"></div>
+<span>支出額の少ない順をトップとして扱う</span>
+</label>
+</div>
+<div class="check-row" style="margin-left:30px;" onclick="vibe();toggleDetailCheck('check-rank-nozero')">
+<div class="custom-check" id="check-rank-nozero"></div>
+<span>支出額ゼロのカテゴリ・タグを除外</span>
+</div>
+</div>
+<div class="s-hr"></div>
+<div class="check-row" onclick="vibe();toggleDetailCheck('check-compare')">
+<div class="custom-check" id="check-compare"></div>
+<span>前期間との比較を表示する</span>
+</div>
+<div id="group-compare" style="display:none;">
+<div class="s-sub-label" style="margin-top:2px; margin-left:30px;">比較対象</div>
+<div class="tag-container" style="margin-left:30px; margin-bottom:10px;">
+<div class="tag sel-btn" id="btn-cmp-expense" onclick="vibe();toggleSelBtn('cmp','expense')">支出額</div>
+<div class="tag sel-btn" id="btn-cmp-remain" onclick="vibe();toggleSelBtn('cmp','remain')">残予算額</div>
+<div class="tag sel-btn" id="btn-cmp-category" onclick="vibe();toggleSelBtn('cmp','category')">カテゴリ</div>
+<div class="tag sel-btn" id="btn-cmp-tag" onclick="vibe();toggleSelBtn('cmp','tag')">タグ</div>
+</div>
+<div class="check-row" style="margin-left:30px;" onclick="vibe();toggleDetailCheck('check-cmp-percent')">
+<div class="custom-check" id="check-cmp-percent"></div>
+<span>比較を円ではなく％で表示する</span>
+</div>
+</div>
+</div>
+</div>
+
+<!-- ── 利用開始月 ── -->
+<div class="section-card">
+<div class="s-num-label"><span class="s-num">4</span>利用開始月</div>
+<div style="font-size:12px;color:#64748b;margin-bottom:10px;line-height:1.6;">
+集計の起点となる月を設定します。設定した月より前のデータは分析から除外されます。<br>
+利用開始月より前の日付に入力すると確認ポップアップが表示されます。
+</div>
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+<input type="month" id="app-start-month-val"
+style="flex:1;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;font-size:15px;">
+<button onclick="vibe();saveAppStartMonth()"
+style="padding:10px 16px;background:#0984e3;color:white;border:none;border-radius:10px;font-size:13px;font-weight:600;white-space:nowrap;">保存</button>
+<button onclick="vibe();clearAppStartMonth()"
+style="padding:10px 12px;background:#f1f5f9;color:#64748b;border:1px solid #cbd5e1;border-radius:10px;font-size:13px;white-space:nowrap;">クリア</button>
+</div>
+<div id="app-start-month-display" style="font-size:12px;margin-bottom:2px;"></div>
+</div>
+
+<div class="section-card">
+<div class="s-num-label"><span class="s-num">5</span>予算期間と管理</div>
+<div class="setting-row">
+<span>月の起点日を設定する</span>
+<div class="toggle-wrap" id="toggle-closing" onclick="vibe();toggleSwitch('toggle-closing','group-closing')"><div class="toggle-knob"></div></div>
+</div>
+<div id="group-closing">
+<div class="setting-row" style="align-items:center;">
+<span>予算期間の起点日</span>
+<div class="day-input-row">
+<input type="number" id="period-start-day-val" value="25" min="1" max="31"
+class="day-input" onchange="onSettingSelectChange(this.id)">
+<span class="day-unit">日</span>
+</div>
+</div>
+<div id="period-preview" style="display:none;font-size:12px;color:#0984e3;background:#eff6ff;border-radius:10px;padding:8px 12px;margin:4px 0 8px;line-height:1.7;"></div>
+<div style="font-size:11px;color:#94a3b8;margin-bottom:4px;">
+カード締日・給与日など区切りとなる日を設定します。<br>
+29〜31日を設定した場合、その日が存在しない月は月末日を使用します。（例：31日設定で2月 → 28日または29日）
+</div>
+</div>
+<div class="s-hr"></div>
+<!-- 予算・固定費管理ボタン -->
+<div id="bm-current-summary" style="background:#f1f5f9;border-radius:12px;padding:12px 14px;margin-bottom:12px;display:none;">
+<!-- JS で予算サマリーを描画 -->
+</div>
+<button class="sub-btn sub-btn-primary" onclick="vibe();openBudgetManagerModal()" style="margin-bottom:0;">
+📊 予算・固定費の管理
+</button>
+<div style="font-size:11px;color:#94a3b8;margin-top:6px;line-height:1.6;">
+当月・過去の月の予算設定、臨時収入（賞与など）の追加、<br>固定費の追加・変更・終了ができます
+</div>
+</div>
+
+<div class="section-card">
+<div class="s-num-label" style="justify-content:space-between;">
+<div style="display:flex;align-items:center;gap:8px;"><span class="s-num">6</span>固定費の反映方法</div>
+<span id="fixed-total-display" style="display:none;" class="fixed-total-badge">合計 ¥ 0</span>
+</div>
+<div class="setting-row">
+<span>固定費を設定する</span>
+<div class="toggle-wrap" id="toggle-fixed" onclick="vibe();toggleFixedMain()"><div class="toggle-knob"></div></div>
+</div>
+<div id="group-fixed" style="display:none;">
+<div class="s-hr" style="margin-top:4px;"></div>
+<div class="s-sub-label">固定費の反映方法（どちらか一方を選択）</div>
+<label class="radio-opt radio-opt-sm" onclick="vibe();setFixedMode('ADD')">
+<div class="radio-circle radio-circle-sm" id="dot-fixed-mode-ADD"></div>
+<div><div class="radio-title-sm">支出額に加算</div><div class="radio-desc">今月の支出 = 実支出 ＋ 固定費</div></div>
+</label>
+<label class="radio-opt radio-opt-sm" onclick="vibe();setFixedMode('BUDGET')">
+<div class="radio-circle radio-circle-sm" id="dot-fixed-mode-BUDGET"></div>
+<div><div class="radio-title-sm">予算額から減算</div><div class="radio-desc">使える予算 = 設定予算 − 固定費</div></div>
+</label>
+<label class="radio-opt radio-opt-sm" onclick="vibe();setFixedMode('NONE')">
+<div class="radio-circle radio-circle-sm" id="dot-fixed-mode-NONE"></div>
+<div><div class="radio-title-sm">表示のみ（サマリーに小さく表示）</div><div class="radio-desc">計算への影響なし</div></div>
+</label>
+</div>
+</div>
+
+<div class="section-card" id="acct-settings-section">
+<div class="s-num-label"><span class="s-num">7</span>アカウント管理</div>
+<div class="s-sub-label">アカウント切り替え・名称変更</div>
+<div id="acct-settings-list">
+<!-- JS で生成 -->
+</div>
+</div>
+
+<div class="section-card">
+<div class="s-num-label"><span class="s-num">8</span>データ管理</div>
+<div class="s-sub-label">バックアップ・書き出し</div>
+<button class="sub-btn" onclick="vibe();doExport()">📤 JSONファイルにエクスポート</button>
+<div style="font-size:11px;color:var(--text-sub);margin:4px 0 12px 2px;">端末の「外部ストレージ / kakeibo_backup_*.json」に保存</div>
+<div class="s-sub-label">復元・読み込み</div>
+<button class="sub-btn" onclick="vibe();openImportModal()">📥 JSONファイルからインポート</button>
+<div style="font-size:11px;color:var(--text-sub);margin:4px 0 4px 2px;">インポート前に自動バックアップを作成します</div>
+</div>
+
+</div>
+
+<!-- ===== 分析タブ ===== -->
+<div id="view-analytics" class="container" style="display:none;">
+
+<!-- フィルター行（折り畳み対応） -->
+<div class="section-card" style="padding:8px 12px;" id="an-filter-card">
+<!-- ヘッダー行：期間チップ＋折り畳みボタン -->
+<div style="display:flex;align-items:center;gap:6px;">
+<div class="analytics-period-row" id="an-preset-row" style="flex:1;min-width:0;">
+<div class="an-period-chip selected" data-v="MONTH"  onclick="vibe();setAnPreset('MONTH')">当月</div>
+<div class="an-period-chip" data-v="PREV_MONTH"      onclick="vibe();setAnPreset('PREV_MONTH')">前月</div>
+<div class="an-period-chip" data-v="3M"              onclick="vibe();setAnPreset('3M')">3ヶ月</div>
+<div class="an-period-chip" data-v="6M"              onclick="vibe();setAnPreset('6M')">半年</div>
+<div class="an-period-chip" data-v="1Y"              onclick="vibe();setAnPreset('1Y')">1年</div>
+<div class="an-period-chip" data-v="ALL"             onclick="vibe();setAnPreset('ALL')">全期間</div>
+<div class="an-period-chip" data-v="CUSTOM"          onclick="vibe();setAnPreset('CUSTOM')">指定</div>
+</div>
+<button onclick="vibe();toggleAnFilterCard()" id="an-filter-fold-btn"
+style="flex-shrink:0;background:none;border:1px solid #e2e8f0;border-radius:8px;padding:4px 8px;font-size:14px;color:#94a3b8;line-height:1;">▲</button>
+</div>
+<!-- 折り畳み対象コンテンツ -->
+<div id="an-filter-body">
+<!-- 日付指定 -->
+<div id="an-custom-period" style="display:none;margin-top:6px;">
+<div class="srch-date-row">
+<input type="date" id="an-date-from" class="srch-date-input an-date-input" onchange="renderAnalytics()">
+<span class="srch-date-sep">〜</span>
+<input type="date" id="an-date-to"   class="srch-date-input an-date-input" onchange="renderAnalytics()">
+</div>
+</div>
+<!-- 絞込み＋トグルボタン群（1行にまとめる） -->
+<div style="display:flex;align-items:center;gap:6px;margin-top:6px;flex-wrap:wrap;">
+<div id="an-filter-btn" class="an-filter-btn" onclick="vibe();openAnFilter()" style="font-size:11px;padding:4px 8px;">
+<span id="an-filter-label">絞込み：全て</span> ▼
+</div>
+<button id="an-closing-btn" class="an-closing-btn" onclick="toggleAnClosing()" style="display:none;font-size:11px;padding:4px 8px;">
+<span class="an-closing-label">📅 締日 OFF</span>
+</button>
+<button id="an-fixed-btn" class="an-closing-btn" onclick="toggleAnFixed()" style="display:none;font-size:11px;padding:4px 8px;">
+<span class="an-fixed-label">💴 固定費 OFF</span>
+</button>
+<button id="an-nobudget-btn" class="an-closing-btn" onclick="toggleAnNoBudget()" style="display:none;font-size:11px;padding:4px 8px;">
+<span class="an-nobudget-label">⛔ 未設定除外 OFF</span>
+</button>
+</div>
+<!-- 集計期間・フィルターチップ -->
+<div id="an-period-disp" style="font-size:11px;color:#64748b;margin-top:4px;padding:0 2px;"></div>
+<div id="an-active-chips-row" style="display:none;margin-top:4px;">
+<div id="an-active-chips" class="srch-active-chips"></div>
+</div>
+</div>
+</div>
+
+<!-- グラフタブ＋折り畳みボタン -->
+<div style="display:flex;align-items:stretch;gap:0;">
+<div class="an-tabs" style="flex:1;">
+<div class="an-tab active" id="an-tab-trend"   onclick="vibe();setAnTab('trend')">支出推移</div>
+<div class="an-tab" id="an-tab-cat"            onclick="vibe();setAnTab('cat')">カテゴリ比率</div>
+<div class="an-tab" id="an-tab-pts"            onclick="vibe();setAnTab('pts')">ポイント</div>
+<div class="an-tab" id="an-tab-budget"         onclick="vibe();setAnTab('budget')">予算消化率</div>
+</div>
+<button onclick="vibe();toggleAnChartCard()" id="an-chart-fold-btn"
+style="background:#f8fafc;border:none;border-left:1px solid #e2e8f0;padding:0 10px;font-size:14px;color:#94a3b8;cursor:pointer;">▲</button>
+</div>
+
+<!-- グラフエリア -->
+<div class="section-card" id="an-chart-card" style="padding:10px 12px;">
+<div id="an-empty" style="text-align:center;color:var(--text-sub);padding:20px;display:none;">データがありません</div>
+<canvas id="an-canvas" style="width:100%;max-height:260px;"></canvas>
+</div>
+
+<!-- 集計サマリー -->
+<div class="section-card" id="an-summary-card">
+<div id="an-summary-content"></div>
+</div>
+
+</div>
+
+<!-- 分析フィルターモーダル -->
+<div id="an-filter-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.65);z-index:4000;align-items:flex-end;justify-content:center;">
+<div class="srch-box">
+<div class="srch-header">
+<span>分析の絞込み</span>
+<button class="srch-close" onclick="vibe();closeAnFilter()">✕</button>
+</div>
+<div class="srch-body">
+<div class="srch-section">
+<div class="srch-label">メモ検索</div>
+<input type="text" id="an-memo" class="srch-memo-input" placeholder="メモのキーワード">
+</div>
+<div class="srch-section">
+<div class="srch-label">カテゴリ <span class="srch-hint">（複数選択可）</span></div>
+<div id="an-cat-area" class="srch-chip-area"></div>
+</div>
+<div class="srch-section">
+<div class="srch-label">タグ <span class="srch-hint">（複数選択可）</span></div>
+<div id="an-tag-area" class="srch-chip-area"></div>
+</div>
+</div>
+<div class="srch-footer">
+<button class="srch-reset-btn" onclick="vibe();resetAnFilter()">リセット</button>
+<button class="srch-exec-btn"  onclick="vibe();applyAnFilter()">適用</button>
+</div>
+</div>
+</div>
+
+<button id="actionFab" onclick="vibe();batchAction()">一括操作</button>
+<div class="tab-bar">
+<div class="tab-item active" id="nav-in"  onclick="vibe();nav('input')"><span>📝</span>入力</div>
+<div class="tab-item" id="nav-hi"         onclick="vibe();nav('history')"><span>📅</span>履歴</div>
+<div class="tab-item" id="nav-an"         onclick="vibe();nav('analytics')"><span>📊</span>分析</div>
+<div class="tab-item" id="nav-set"        onclick="vibe();nav('settings')"><span>⚙️</span>設定</div>
+</div>
+
+<script src="app.js?v=1772494473"></script>
+</body>
+</html>

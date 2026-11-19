@@ -1,0 +1,6 @@
+{
+  "name": "kakeibo",
+  "description": "Cloned kakeibo Android application from GitHub.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -315,6 +315,9 @@ fun getCardPointStats(filterJson: String): String = dbHelper.getCardPointStats(f
 @JavascriptInterface
 fun getCostTagStats(filterJson: String): String = dbHelper.getCostTagStats(filterJson)
 
+@JavascriptInterface
+fun getEarliestExpenseDate(): String = dbHelper.getEarliestExpenseDate()
+
 // ===== システム =====
 @JavascriptInterface fun exitApp() { runOnUiThread { finish() } }
 }
