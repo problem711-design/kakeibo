@@ -5,6 +5,21 @@ let isInitialized   = false;
 let settingsDirty    = false;
 let _loadingSettings = false;  // loadSettingsFromDB 実行中は dirty を立てない
 let isMemoOpen = false;
+let curEntryType = 'EXPENSE';  // 'EXPENSE' | 'INCOME' (一般家計簿モード時のみ INCOME 使用)
+let curBizEntryKind = 'SALE';  // 'SALE' | 'COST' (売上管理モード時の入力タブ)
+let curTaxRate = 0;            // 0 | 10 | 8
+let curInvoiceFlag = 0;        // 0 | 1
+let curSettlementStatus = 'PAID'; // 'PAID' | 'UNPAID'
+let curDueDate = '';
+let anShowYoY = false;
+let _memoSuggestTimer = null;
+let _lastSaveSnapshot = null;
+let _toastTimer = null;
+let _calcExpr = '';
+let _calcOpen = false;
+let _skipClearSearchOnce = false;
+let calCurrentYm = '';
+let calSelectedDate = '';
 
 // ===== アカウントステート =====
 let acctInfo = { current: 1, accounts: [
@@ -25,6 +40,8 @@ let anDateTo     = '';
 let anCatIds     = [];
 let anTagIds     = [];
 let anMemo       = '';   // 分析タブのメモ絞り込み
+let anEntryType  = 'EXPENSE'; // 'EXPENSE' | 'INCOME' | 'ALL'
+let anTrendMode  = 'expense'; // 'expense' | 'cashflow'
 let anChart      = null;  // Chart.js インスタンス
 let anPtsBreakdown = false; // ポイントタブのカテゴリ内訳表示フラグ
 
@@ -53,6 +70,7 @@ compareOn   : false,
 cmpTargets  : [],
 cmpPercent  : false,
 bizMode     : false,    // true = 売上管理モード
+defaultTaxRate: '0',
 };
 }
 let S = _defaultSettings();
@@ -150,7 +168,11 @@ if (r) { try { DB.exitApp(); } catch(e) {} }
 function showExitDialog() { handleBack(); }
 
 // ===== 初期化 =====
-window.onload = () => { resetDate(); attemptInitialization(); };
+window.onload = () => {
+document.body.classList.add('input-tab-active');
+resetDate();
+attemptInitialization();
+};
 
 function attemptInitialization() {
 if (typeof DB !== "undefined") { initApp(); } else { setTimeout(attemptInitialization, 200); }
@@ -179,10 +201,14 @@ loadSettingsFromDB();
 }
 } catch(e) { console.error('loadSettingsFromDB:', e); }
 try { initAccount(); }        catch(e) { console.error('initAccount:', e); }
+try { _applyEntryTypeUI(); }  catch(e) {}
 try { refresh(); }            catch(e) { console.error('refresh:', e); }
+try { renderTemplateStrip(); } catch(e) {}
 try { _autoRolloverBudgetIfNeeded(); } catch(e) { console.error('autoRollover:', e); }
 try { updateSummary(); }      catch(e) { console.error('updateSummary:', e); }
 try { _renderBmCurrentSummary(); } catch(e) {}
+try { _refreshUnpaidAlerts(); } catch(e) {}
+try { checkBackupReminder(); } catch(e) {}
 setTimeout(() => {
 try { renderInfoPanel(); } catch(e) { console.error('renderInfoPanel:', e); }
 // BM_MONTHLY / BM_ONCE: 期間開始日チェック
@@ -207,6 +233,7 @@ const spanBucket = days => days <= 10 ? 'W' : days <= 35 ? 'M' : days <= 200 ? '
 const curBucket = spanBucket(curDays);
 
 let rolledAmount = -1;
+let rolledFromPeriod = '';
 try {
 const hist = JSON.parse(DB.getBudgetHistory(36) || '[]');
 for (const bp of hist) {
@@ -215,6 +242,7 @@ if (bp.baseAmount === undefined || bp.baseAmount < 0) continue;
 const bpDays = Math.round((_parseYmd(bp.periodTo) - _parseYmd(bp.periodFrom)) / 86400000) + 1;
 if (spanBucket(bpDays) === curBucket) {
 rolledAmount = bp.baseAmount;
+rolledFromPeriod = bp.periodFrom;
 break;
 }
 }
@@ -229,6 +257,9 @@ rolledAmount = legacy;
 
 if (rolledAmount >= 0) {
 DB.setBudgetBase(period.from, period.to, rolledAmount);
+if (rolledFromPeriod && typeof DB.copyCategoryBudgets === 'function') {
+try { DB.copyCategoryBudgets(rolledFromPeriod, period.from); } catch(e) {}
+}
 S.baseBudget = String(rolledAmount);
 try { DB.setSetting('baseBudget', String(rolledAmount)); } catch(e) {}
 return true;
@@ -287,11 +318,24 @@ document.getElementById('modal-ok').innerText = '設定する';
 
 // ===== 日付 =====
 function resetDate() {
-const t = new Date();
-t.setMinutes(t.getMinutes() - t.getTimezoneOffset());
-const val = t.toISOString().split('T')[0];
-document.getElementById('date').value = val;
+const val = _todayYmd();
+const el = document.getElementById('date');
+if (el) el.value = val;
 updateDateLabel(val);
+}
+
+function onAppDateChanged() {
+try {
+if (editId === -1) resetDate();
+_clearEarliestDateCache();
+_autoRolloverBudgetIfNeeded();
+updateSummary();
+renderInfoPanel();
+_renderBmCurrentSummary();
+checkBudgetPeriodStart();
+if (document.getElementById('view-analytics')?.style.display !== 'none') renderAnalytics();
+if (document.getElementById('view-history')?.style.display !== 'none' && mode === 'CALENDAR') renderCalendarView(calCurrentYm);
+} catch(e) { console.error('onAppDateChanged:', e); }
 }
 
 function updateDateLabel(val) {
@@ -336,6 +380,12 @@ function toggleMemo() {
 isMemoOpen = !isMemoOpen;
 document.getElementById('memoArea').style.display = isMemoOpen ? 'block' : 'none';
 document.getElementById('memoToggleBtn').innerText = isMemoOpen ? 'メモ ×' : 'メモ ＋';
+if (isMemoOpen && isBizMode()) {
+_renderMemoSuggestions(document.getElementById('itemName')?.value || '');
+} else if (!isMemoOpen) {
+const sr = document.getElementById('memo-suggest-row');
+if (sr) sr.style.display = 'none';
+}
 }
 
 // ===== 日付・締め日・シーズン共通計算ヘルパー =====
@@ -421,6 +471,12 @@ startM = 4;
 endY = startY + 1;
 endM = 3;
 label = `${startY}年度`;
+} else if (seasonType === 'CAL_YEAR') {
+startY = refY + dir;
+startM = 1;
+endY = startY;
+endM = 12;
+label = `${startY}年(確定申告)`;
 } else {
 // 'Q': 四半期
 const qIdx = Math.floor((refM - 1) / 3);
@@ -541,18 +597,33 @@ return { from: cp.from, to: cp.to, label: cp.label, mode: 'CLOSING' };
 }
 
 // ===== サマリー更新 =====
+function _getBizNetSummary(fromStr, toStr) {
+if (typeof DB !== 'undefined' && typeof DB.getBizCashflowByRange === 'function') {
+try {
+const o = JSON.parse(DB.getBizCashflowByRange(fromStr, toStr) || '{}');
+return {
+grossSales: Number(o.grossSales || 0),
+costTotal: Number(o.costTotal || 0),
+netSales: Number(o.netSales || 0),
+unpaidSales: Number(o.unpaidSales || 0),
+unpaidCount: Number(o.unpaidCount || 0)
+};
+} catch(e) {}
+}
+const raw = (typeof DB !== 'undefined' && typeof DB.getTotalByRange === 'function') ? (DB.getTotalByRange(fromStr, toStr) || 0) : 0;
+const cost = _getExpenseTotalForRange(fromStr, toStr);
+return { grossSales: raw - cost, costTotal: cost, netSales: raw - 2 * cost, unpaidSales: 0, unpaidCount: 0 };
+}
+
 function updateSummary() {
 if (typeof DB === 'undefined') return;
 try {
 const period = getCurrentPeriod();
 _autoRolloverBudgetIfNeeded(period);
 
-const _rawExpTotal = DB.getTotalByRange(period.from, period.to) || 0;
-const _expenseAmt  = isBizMode() ? _getExpenseTotalForRange(period.from, period.to) : 0;
-// 純売上 = raw − 経費エントリ除去 − 経費額控除 = raw − 2*expenseAmt（マイナス許可）
-const expTotal     = isBizMode()
-? _rawExpTotal - 2 * _expenseAmt
-: _rawExpTotal;
+const _biz = isBizMode();
+const bizCf = _biz ? _getBizNetSummary(period.from, period.to) : null;
+const expTotal = _biz ? bizCf.netSales : (DB.getTotalByRange(period.from, period.to) || 0);
 
 // 固定費: 対象期間時点で有効な fixed_cost_history を参照
 const fixedTotal = _getPeriodFixedTotal(period);
@@ -568,8 +639,6 @@ baseBudget = budgetInfo.totalAmount ?? -1;
 const parsed = parseInt(S.baseBudget);
 if (!isNaN(parsed) && S.baseBudget !== '') baseBudget = parsed;
 }
-
-const _biz = isBizMode();
 const effectiveBudget = (S.fixedOn && S.fixedMode === 'BUDGET' && baseBudget >= 0)
 ? (_biz ? Math.max(0, baseBudget + fixedTotal) : Math.max(0, baseBudget - fixedTotal))
 : Math.max(0, baseBudget);
@@ -593,14 +662,18 @@ const remainEl    = document.getElementById('summary-budget-remain');
 const ofEl        = document.getElementById('summary-budget-of');
 const barFillEl   = document.getElementById('summary-bar-fill');
 const noBudgetEl  = document.getElementById('summary-no-budget');
+const cfSubEl     = document.getElementById('summary-cashflow-sub');
+const cfIncEl     = document.getElementById('summary-cf-inc');
+const cfBalEl     = document.getElementById('summary-cf-bal');
 
-// 予算未設定警告（EXP以外で予算未設定の場合）
+// 予算未設定警告（REMAIN/BOTH時に予算未設定の場合）
 const hasBudget   = baseBudget >= 0;
-const needBudget  = (S.simpleView !== 'EXP') && !hasBudget;
+const effectiveView = (_biz && S.simpleView === 'CASHFLOW') ? 'BOTH' : S.simpleView;
+const needBudget  = (effectiveView === 'REMAIN' || effectiveView === 'BOTH') && !hasBudget;
 if (noBudgetEl) noBudgetEl.style.display = needBudget ? 'block' : 'none';
 
 // ── simpleView 分岐 ──
-if (S.simpleView === 'REMAIN') {
+if (effectiveView === 'REMAIN') {
 if (totalEl)     totalEl.style.display = 'none';
 if (budgetRowEl) budgetRowEl.classList.add('remain-only');
 if (hasBudget) {
@@ -610,7 +683,7 @@ _fillBudgetRow(remainEl, ofEl, barFillEl, remain, effectiveBudget, displayTotal,
 if (budgetRowEl) budgetRowEl.style.display = 'none';
 }
 
-} else if (S.simpleView === 'EXP') {
+} else if (effectiveView === 'EXP') {
 if (totalEl) {
 totalEl.style.display = 'block';
 totalEl.innerText = (displayTotal < 0 ? '\u2212\u00a5 ' : '\u00a5 ') + Math.abs(displayTotal).toLocaleString();
@@ -619,7 +692,7 @@ totalEl.style.color = (_biz && displayTotal < 0) ? '#ef4444' : '';
 if (budgetRowEl) { budgetRowEl.style.display = 'none'; budgetRowEl.classList.remove('remain-only'); }
 
 } else {
-// BOTH
+// BOTH or CASHFLOW
 if (totalEl) {
 totalEl.style.display = 'block';
 totalEl.innerText = (displayTotal < 0 ? '\u2212\u00a5 ' : '\u00a5 ') + Math.abs(displayTotal).toLocaleString();
@@ -632,6 +705,31 @@ _fillBudgetRow(remainEl, ofEl, barFillEl, remain, effectiveBudget, displayTotal,
 } else {
 if (budgetRowEl) budgetRowEl.style.display = 'none';
 }
+}
+
+// 収支バランスサブ表示（通常CASHFLOW または 売上管理モード時の売上/経費内訳）
+if (cfSubEl && _biz && bizCf && (bizCf.costTotal > 0 || bizCf.unpaidCount > 0 || bizCf.grossSales > 0)) {
+if (cfIncEl) cfIncEl.innerText = `総売上 ¥${bizCf.grossSales.toLocaleString()}`;
+if (cfBalEl) {
+const uTxt = bizCf.unpaidCount > 0 ? ` / 未入金 ¥${bizCf.unpaidSales.toLocaleString()}` : '';
+cfBalEl.innerText = `経費 −¥${bizCf.costTotal.toLocaleString()}${uTxt}`;
+cfBalEl.className = bizCf.unpaidCount > 0 ? 'minus' : '';
+}
+cfSubEl.style.display = 'flex';
+} else if (cfSubEl && !_biz && S.simpleView === 'CASHFLOW' && typeof DB.getCashflowByRange === 'function') {
+try {
+const cf = JSON.parse(DB.getCashflowByRange(period.from, period.to) || '{}');
+const inc = Number(cf.income || 0);
+const bal = inc - displayTotal;
+if (cfIncEl) cfIncEl.innerText = `収入 ¥${inc.toLocaleString()}`;
+if (cfBalEl) {
+cfBalEl.innerText = `収支 ${bal >= 0 ? '+' : '−'}¥${Math.abs(bal).toLocaleString()}`;
+cfBalEl.className = bal >= 0 ? 'plus' : 'minus';
+}
+cfSubEl.style.display = 'flex';
+} catch(e) { cfSubEl.style.display = 'none'; }
+} else if (cfSubEl) {
+cfSubEl.style.display = 'none';
 }
 
 // 固定費サブ表示
@@ -647,6 +745,7 @@ if (fixedSubEl) fixedSubEl.style.display = 'flex';
 if (fixedSubEl) fixedSubEl.style.display = 'none';
 }
 _renderBmCurrentSummary();
+_refreshUnpaidAlerts();
 } catch(e) { console.error('updateSummary:', e); }
 }
 
@@ -895,7 +994,7 @@ let prevPeriod;
 const useClosing = S.closingOn === true || S.closingOn === 'true';
 if (period.mode === 'SEASON') {
 const anchor = parseInt(S.periodStartDay) || 25;
-prevPeriod = _calcSeasonPeriod(new Date(), S.seasonType || 'Q', useClosing, anchor, -1);
+prevPeriod = _calcSeasonPeriod(_parseYmd(period.from), S.seasonType || 'Q', useClosing, anchor, -1);
 } else if (period.mode === 'YEAR') {
 const py = parseInt(period.from.slice(0, 4)) - 1;
 prevPeriod = { from: `${py}-01-01`, to: `${py}-12-31`, label: `${py}年`, mode: 'YEAR' };
@@ -929,15 +1028,11 @@ const titleEl = document.getElementById('info-compare-title');
 if (titleEl) titleEl.innerText = `前期間比較（${prevLabel}）`;
 
 const cmpItems = S.cmpTargets.length > 0 ? S.cmpTargets : ['expense'];
-const _curRaw  = DB.getTotalByRange(period.from, period.to) || 0;
-const _prevRaw = DB.getTotalByRange(prevFromStr, prevToStr) || 0;
-const _curExp  = biz ? _getExpenseTotalForRange(period.from, period.to) : 0;
-const _prevExp = biz ? _getExpenseTotalForRange(prevFromStr, prevToStr) : 0;
 const curFixed  = _getPeriodFixedTotal(period);
 const prevFixed = _getPeriodFixedTotal(prevPeriod);
 
-let curTotal  = biz ? (_curRaw - 2 * _curExp) : _curRaw;
-let prevTotal = biz ? (_prevRaw - 2 * _prevExp) : _prevRaw;
+let curTotal  = biz ? _getBizNetSummary(period.from, period.to).netSales : (DB.getTotalByRange(period.from, period.to) || 0);
+let prevTotal = biz ? _getBizNetSummary(prevFromStr, prevToStr).netSales : (DB.getTotalByRange(prevFromStr, prevToStr) || 0);
 if (S.fixedOn && S.fixedMode === 'ADD') {
 curTotal  = biz ? (curTotal - curFixed) : (curTotal + curFixed);
 prevTotal = biz ? (prevTotal - prevFixed) : (prevTotal + prevFixed);
@@ -948,6 +1043,14 @@ let html = '';
 // 支出額・残予算は通常行
 if (cmpItems.includes('expense')) {
 html += _cmpRowHtml(biz ? '純売上' : '支出合計', curTotal, prevTotal, biz);
+if (biz && period.mode === 'SEASON' && (S.seasonType || 'Q') !== 'CAL_YEAR' && (S.seasonType || 'Q') !== 'FY') {
+const yoyFrom = _shiftYearYmd(period.from, -1);
+const yoyTo   = _shiftYearYmd(period.to, -1);
+const yoyFixed = _getPeriodFixedTotal({ from: yoyFrom, to: yoyTo, mode: period.mode });
+let yoyTotal = _getBizNetSummary(yoyFrom, yoyTo).netSales;
+if (S.fixedOn && S.fixedMode === 'ADD') yoyTotal -= yoyFixed;
+html += _cmpRowHtml('前年同期比', curTotal, yoyTotal, true);
+}
 }
 if (cmpItems.includes('remain')) {
 let curBase = -1, prevBase = -1;
@@ -1079,7 +1182,16 @@ function renderRanking() { renderInfoPanel(); }
 function refresh() {
 if (typeof DB === "undefined") return;
 try {
-const cats = JSON.parse(DB.getMaster('categories') || "[]");
+const allCats = JSON.parse(DB.getMaster('categories') || "[]");
+const cats = isBizMode()
+? allCats
+: allCats.filter(c => {
+const ct = c.cat_type || 'EXPENSE';
+return ct === 'BOTH' || ct === curEntryType;
+});
+if (selCId !== null && !cats.some(c => c.id === selCId)) {
+selCId = null;
+}
 document.getElementById('categoryGrid').innerHTML = cats.map(c =>
 `<div class="tile ${selCId===c.id?'selected':''}" onclick="vibe();selCId=${c.id};refresh()">${_escHtml(c.name)}</div>`
 ).join('');
@@ -1098,6 +1210,7 @@ document.getElementById('cardArea').innerHTML = cards.map(c =>
 function toggleTag(id) { if (selTIds.has(id)) selTIds.delete(id); else selTIds.add(id); refresh(); }
 
 function toggleCardUse() {
+if (!isBizMode() && curEntryType === 'INCOME') return;
 isCard = !isCard;
 const btn = document.getElementById('cardBtn');
 btn.classList.toggle('on', isCard);
@@ -1181,6 +1294,8 @@ S.compareOn     = db.compareOn     === 'true';
 S.cmpTargets    = db.cmpTargets    ? db.cmpTargets.split(',').filter(Boolean)    : [];
 S.cmpPercent    = db.cmpPercent    === 'true';
 S.bizMode       = db.bizMode       === 'true';
+S.defaultTaxRate = db.defaultTaxRate || d.defaultTaxRate || '0';
+if (editId === -1) curTaxRate = S.bizMode ? (parseInt(S.defaultTaxRate, 10) || 0) : 0;
 
 applySettingsToDOM();
 refreshPointsCardUI();
@@ -1211,6 +1326,9 @@ const pu = document.getElementById('set-period-unit'); if(pu) pu.value = S.perio
 const st = document.getElementById('set-season-type'); if(st) st.value = S.seasonType;
 const sv = document.getElementById('set-simple-view'); if(sv) sv.value = S.simpleView;
 const bm = document.getElementById('set-biz-mode'); if(bm) bm.value = String(S.bizMode);
+const dt = document.getElementById('set-default-tax'); if(dt) dt.value = S.defaultTaxRate || '0';
+const advDet = document.getElementById('settings-adv-biz');
+if (advDet && (S.bizMode || S.periodUnit === 'SEASON')) advDet.open = true;
 toggleSettingUI();
 
 // ポイント
@@ -1323,7 +1441,52 @@ if (svEl && svEl.options.length >= 3) {
 svEl.options[0].text = biz ? '売上額のみ'        : '支出額のみ';
 svEl.options[1].text = biz ? '残予算のみ'        : '残予算のみ';
 svEl.options[2].text = biz ? '売上額 & 残予算'   : '支出額 & 残予算';
+if (svEl.options[3]) svEl.options[3].style.display = biz ? 'none' : '';
 }
+
+// 2値セグメントタブ（家計簿: 支出/収入、売上管理: 売上/経費）
+const etTabs = document.getElementById('input-entry-type-tabs');
+if (etTabs) etTabs.style.display = 'flex';
+const etExpBtn = document.getElementById('et-btn-expense');
+const etIncBtn = document.getElementById('et-btn-income');
+if (etExpBtn) etExpBtn.textContent = biz ? '💰 売上' : '支出';
+if (etIncBtn) etIncBtn.textContent = biz ? '🏷️ 経費' : '収入';
+
+// 売上管理専用UI・検索・設定・分析表示切り替え
+const srchEtSec = document.getElementById('srch-entry-type-sec');
+if (srchEtSec) srchEtSec.style.display = biz ? 'none' : '';
+const srchBizSec = document.getElementById('srch-biz-kind-sec');
+if (srchBizSec) srchBizSec.style.display = biz ? '' : 'none';
+const anEtSec = document.getElementById('an-entry-type-sec');
+if (anEtSec) anEtSec.style.display = biz ? 'none' : '';
+const bizMeta = document.getElementById('biz-meta-bar');
+if (bizMeta) bizMeta.style.display = biz ? 'block' : 'none';
+const rowDefTax = document.getElementById('row-biz-default-tax');
+if (rowDefTax) rowDefTax.style.display = biz ? 'flex' : 'none';
+const btnTaxRep = document.getElementById('btn-annual-tax-report');
+if (btnTaxRep) btnTaxRep.style.display = biz ? 'block' : 'none';
+const advBadge = document.getElementById('adv-biz-state-badge');
+if (advBadge) {
+advBadge.textContent = biz ? '売上管理 ON' : '通常モード';
+advBadge.classList.toggle('biz', biz);
+}
+const chipSeason = document.getElementById('an-chip-season');
+if (chipSeason) chipSeason.style.display = biz ? '' : 'none';
+const chipTaxYear = document.getElementById('an-chip-taxyear');
+if (chipTaxYear) chipTaxYear.style.display = biz ? '' : 'none';
+const anTaxBtn = document.getElementById('an-tax-report-btn');
+if (anTaxBtn) anTaxBtn.style.display = biz ? '' : 'none';
+
+if (biz) {
+curEntryType = 'EXPENSE';
+anEntryType = 'EXPENSE';
+anTrendMode = 'expense';
+document.body.classList.remove('income-entry-active');
+} else {
+document.body.classList.remove('biz-cost-entry-active');
+}
+_applyEntryTypeUI();
+_refreshUnpaidAlerts();
 
 // 予算残りラベル
 const budLabelEl = document.getElementById('summary-budget-label');
@@ -1344,6 +1507,463 @@ if (rankLowEl)  rankLowEl.textContent  = biz ? '売上額の少ない順をト�
 // ランキング除外オプション
 const rankNzEl = document.querySelector('#check-rank-nozero')?.nextElementSibling;
 if (rankNzEl) rankNzEl.textContent = biz ? '売上額ゼロのカテゴリ・タグを除外' : '支出額ゼロのカテゴリ・タグを除外';
+}
+
+// ===================================================
+//  v35: トースト & Undo / 収支タブ / 電卓 / 定型入力
+// ===================================================
+function showToast(msg, actionLabel, onAction, durationMs) {
+const el = document.getElementById('app-toast');
+if (!el) return;
+if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; }
+const actionHtml = (actionLabel && typeof onAction === 'function')
+? `<button class="toast-action-btn" id="toast-action-btn">${_escHtml(actionLabel)}</button>`
+: '';
+el.innerHTML = `<span class="toast-msg">${_escHtml(msg)}</span>${actionHtml}`;
+el.style.display = 'flex';
+if (actionHtml) {
+document.getElementById('toast-action-btn').onclick = () => {
+vibe();
+el.style.display = 'none';
+if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; }
+onAction();
+};
+}
+const ms = durationMs || (actionHtml ? 4800 : 2800);
+_toastTimer = setTimeout(() => { el.style.display = 'none'; }, ms);
+}
+
+function undoLastSave() {
+if (!_lastSaveSnapshot) return;
+const snap = _lastSaveSnapshot;
+_lastSaveSnapshot = null;
+try {
+if (snap.mode === 'INSERT' && snap.newId > 0) {
+DB.deleteLog(snap.newId);
+} else if (snap.mode === 'UPDATE' && snap.prevRecord) {
+DB.save(JSON.stringify(snap.prevRecord));
+}
+_clearEarliestDateCache();
+updateSummary();
+renderInfoPanel();
+_renderBmCurrentSummary();
+if (document.getElementById('view-history')?.style.display === 'block') {
+if (mode === 'CALENDAR') renderCalendarView(calCurrentYm);
+else { currentOffset = 0; document.getElementById('displayArea').innerHTML = ''; loadMore(); }
+}
+showToast('保存を取り消しました');
+} catch(e) { console.error('undoLastSave:', e); }
+}
+
+function setInputEntryType(type) {
+if (isBizMode()) {
+setBizEntryKind(type === 'INCOME' ? 'COST' : 'SALE');
+return;
+}
+curEntryType = (type === 'INCOME') ? 'INCOME' : 'EXPENSE';
+_applyEntryTypeUI();
+refresh();
+}
+
+function setBizEntryKind(kind) {
+curBizEntryKind = (kind === 'COST') ? 'COST' : 'SALE';
+curEntryType = 'EXPENSE';
+if (curBizEntryKind === 'COST') {
+isCard = true;
+if (!selCardId && typeof DB !== 'undefined') {
+try {
+const tags = JSON.parse(DB.getMaster('cost_tags') || '[]');
+if (tags.length > 0) selCardId = Number(tags[0].id);
+} catch(e) {}
+}
+} else {
+isCard = false;
+selCardId = null;
+}
+_applyEntryTypeUI();
+refresh();
+}
+
+function setBizTaxRate(rate) {
+curTaxRate = (rate === 10 || rate === 8) ? rate : 0;
+_renderBizMetaUI();
+}
+function toggleBizInvoiceFlag() {
+curInvoiceFlag = curInvoiceFlag === 1 ? 0 : 1;
+_renderBizMetaUI();
+}
+function setBizSettlementStatus(ss) {
+curSettlementStatus = (ss === 'UNPAID') ? 'UNPAID' : 'PAID';
+if (curSettlementStatus === 'PAID') curDueDate = '';
+_renderBizMetaUI();
+}
+function onBizDueDateChange() {
+const el = document.getElementById('biz-due-date');
+curDueDate = el ? (el.value || '') : '';
+}
+function _renderBizMetaUI() {
+document.querySelectorAll('#biz-meta-bar .biz-chip[data-tax]').forEach(el => {
+el.classList.toggle('selected', Number(el.dataset.tax) === Number(curTaxRate));
+});
+document.getElementById('biz-invoice-chip')?.classList.toggle('selected', curInvoiceFlag === 1);
+const isCost = curBizEntryKind === 'COST';
+const paidBtn = document.querySelector('#biz-meta-bar .biz-chip[data-ss="PAID"]');
+const unpaidBtn = document.querySelector('#biz-meta-bar .biz-chip[data-ss="UNPAID"]');
+if (paidBtn) {
+paidBtn.textContent = isCost ? '支払済' : '入金済';
+paidBtn.classList.toggle('selected', curSettlementStatus !== 'UNPAID');
+}
+if (unpaidBtn) {
+unpaidBtn.textContent = isCost ? '未払(買掛)' : '未入金(売掛)';
+unpaidBtn.classList.add('unpaid');
+unpaidBtn.classList.toggle('selected', curSettlementStatus === 'UNPAID');
+}
+const dueEl = document.getElementById('biz-due-date');
+if (dueEl) {
+dueEl.style.display = curSettlementStatus === 'UNPAID' ? 'inline-block' : 'none';
+dueEl.value = curDueDate || '';
+}
+}
+
+function _applyEntryTypeUI() {
+const biz = isBizMode();
+const expBtn = document.getElementById('et-btn-expense');
+const incBtn = document.getElementById('et-btn-income');
+const cardBtn = document.getElementById('cardBtn');
+const cardLink = document.getElementById('card-edit-link');
+const ptSec = document.getElementById('pointSection');
+const ptsWrap = document.getElementById('points-input-wrap');
+
+if (biz) {
+const isCost = curBizEntryKind === 'COST';
+if (expBtn) {
+expBtn.classList.toggle('active', !isCost);
+expBtn.classList.add('sale');
+expBtn.classList.remove('cost');
+}
+if (incBtn) {
+incBtn.classList.toggle('active', isCost);
+incBtn.classList.add('cost');
+incBtn.classList.remove('income');
+}
+document.body.classList.remove('income-entry-active');
+document.body.classList.toggle('biz-cost-entry-active', isCost);
+if (cardBtn) {
+cardBtn.style.display = isCost ? '' : 'none';
+cardBtn.classList.toggle('on', isCost);
+cardBtn.textContent = '経費';
+}
+if (cardLink) cardLink.style.display = isCost ? '' : 'none';
+if (ptSec) ptSec.style.display = isCost ? 'block' : 'none';
+if (ptsWrap) ptsWrap.style.display = 'none';
+if (!isCost) {
+isCard = false;
+selCardId = null;
+}
+_renderBizMetaUI();
+return;
+}
+
+const isInc = curEntryType === 'INCOME';
+if (expBtn) {
+expBtn.classList.toggle('active', !isInc);
+expBtn.classList.remove('sale', 'cost');
+}
+if (incBtn) {
+incBtn.classList.toggle('active', isInc);
+incBtn.classList.add('income');
+incBtn.classList.remove('cost');
+}
+document.body.classList.remove('biz-cost-entry-active');
+document.body.classList.toggle('income-entry-active', isInc);
+if (cardBtn) cardBtn.style.display = isInc ? 'none' : '';
+if (cardLink) cardLink.style.display = isInc ? 'none' : '';
+if (isInc) {
+isCard = false;
+selCardId = null;
+if (cardBtn) cardBtn.classList.remove('on');
+if (ptSec) ptSec.style.display = 'none';
+}
+}
+
+// ── インライン電卓（安全な式評価・eval不使用）──
+function toggleCalcBar() {
+_calcOpen = !_calcOpen;
+const bar = document.getElementById('calc-bar');
+const btn = document.getElementById('calc-toggle-btn');
+if (bar) bar.style.display = _calcOpen ? 'block' : 'none';
+if (btn) btn.classList.toggle('on', _calcOpen);
+if (_calcOpen) {
+const cur = document.getElementById('amount')?.value?.trim() || '';
+_calcExpr = cur;
+_updateCalcDisp();
+}
+}
+function _updateCalcDisp() {
+const el = document.getElementById('calc-expr');
+if (el) el.innerText = _calcExpr || '0';
+}
+function _safeEvalExpr(expr) {
+const clean = String(expr || '').replace(/×/g, '*').replace(/÷/g, '/').replace(/\s+/g, '');
+if (!clean || !/^[0-9.+\-*/]+$/.test(clean)) return null;
+const tokens = clean.match(/\d+(?:\.\d+)?|[+\-*/]/g);
+if (!tokens || tokens.length === 0) return null;
+// 先頭マイナス補助
+if (tokens[0] === '-') tokens.unshift('0');
+// 連続演算子チェック
+let nums = [];
+let ops = [];
+let expectNum = true;
+for (const tk of tokens) {
+if (expectNum) {
+if (!/^\d+(?:\.\d+)?$/.test(tk)) return null;
+nums.push(parseFloat(tk));
+expectNum = false;
+} else {
+if (!/^[+\-*/]$/.test(tk)) return null;
+ops.push(tk);
+expectNum = true;
+}
+}
+if (expectNum && ops.length > 0) return null;
+// 乗除優先パス
+const nums2 = [nums[0]];
+const ops2 = [];
+for (let i = 0; i < ops.length; i++) {
+const op = ops[i], rhs = nums[i + 1];
+if (op === '*' || op === '/') {
+const lhs = nums2.pop();
+if (op === '/' && rhs === 0) return null;
+nums2.push(op === '*' ? lhs * rhs : lhs / rhs);
+} else {
+ops2.push(op);
+nums2.push(rhs);
+}
+}
+let res = nums2[0];
+for (let i = 0; i < ops2.length; i++) {
+res = ops2[i] === '+' ? (res + nums2[i + 1]) : (res - nums2[i + 1]);
+}
+if (!isFinite(res)) return null;
+return Math.max(0, Math.round(res));
+}
+function calcPress(ch) {
+const isOp = '+-*/'.includes(ch);
+if (!_calcExpr && isOp) {
+const cur = document.getElementById('amount')?.value?.trim() || '';
+if (cur) _calcExpr = cur;
+else return;
+}
+if (isOp && _calcExpr && '+-*/'.includes(_calcExpr.slice(-1))) {
+_calcExpr = _calcExpr.slice(0, -1) + ch;
+} else {
+_calcExpr += ch;
+}
+_updateCalcDisp();
+if (/^\d+$/.test(_calcExpr)) {
+const amtEl = document.getElementById('amount');
+if (amtEl) amtEl.value = String(parseInt(_calcExpr, 10));
+}
+}
+function calcClear() {
+_calcExpr = '';
+_updateCalcDisp();
+const amtEl = document.getElementById('amount');
+if (amtEl) amtEl.value = '';
+}
+function calcBackspace() {
+if (!_calcExpr) return;
+_calcExpr = _calcExpr.slice(0, -1);
+_updateCalcDisp();
+if (/^\d+$/.test(_calcExpr)) {
+const amtEl = document.getElementById('amount');
+if (amtEl) amtEl.value = String(parseInt(_calcExpr, 10));
+}
+}
+function calcEvaluate() {
+const src = _calcExpr || document.getElementById('amount')?.value?.trim() || '';
+const res = _safeEvalExpr(src);
+if (res === null) { showToast('計算式を確認してください'); return; }
+const amtEl = document.getElementById('amount');
+if (amtEl) amtEl.value = String(res);
+_calcExpr = String(res);
+_updateCalcDisp();
+}
+function calcApplyTax(rate) {
+const src = _calcExpr || document.getElementById('amount')?.value?.trim() || '0';
+const base = _safeEvalExpr(src);
+if (base === null) return;
+const res = Math.round(base * (1 + rate / 100));
+const amtEl = document.getElementById('amount');
+if (amtEl) amtEl.value = String(res);
+_calcExpr = String(res);
+_updateCalcDisp();
+}
+
+// ── 定型入力テンプレート ──
+let _tplCache = [];
+function renderTemplateStrip() {
+const listEl = document.getElementById('tpl-chip-list');
+if (!listEl || typeof DB === 'undefined' || typeof DB.getInputTemplates !== 'function') return;
+try {
+_tplCache = JSON.parse(DB.getInputTemplates() || '[]');
+} catch(e) { _tplCache = []; }
+const visible = isBizMode()
+? _tplCache.filter(t => (t.entry_type || 'EXPENSE') === 'EXPENSE')
+: _tplCache;
+if (visible.length === 0) {
+listEl.innerHTML = `<span class="tpl-chip-empty">よく使う入力を「＋定型」で登録できます</span>`;
+return;
+}
+listEl.innerHTML = visible.map(t => {
+const isInc = !isBizMode() && (t.entry_type || 'EXPENSE') === 'INCOME';
+const isCostTpl = isBizMode() && Number(t.card_id) >= 10000;
+const cls = isCostTpl ? 'cost' : (isInc ? 'income' : '');
+const prefix = isCostTpl ? '[経] ' : (isInc ? '＋' : '');
+const priceTag = t.price > 0 ? ` ¥${Number(t.price).toLocaleString()}` : '';
+return `<button class="tpl-chip ${cls}" onclick="vibe();applyInputTemplate(${t.id})">${prefix}${_escHtml(t.title)}${priceTag}</button>`;
+}).join('');
+}
+function applyInputTemplate(id) {
+const tpl = _tplCache.find(t => Number(t.id) === Number(id));
+if (!tpl) return;
+editId = -1;
+originalCreatedAt = '';
+const saveBtn = document.getElementById('save-btn');
+if (saveBtn) saveBtn.innerText = '保存';
+const biz = isBizMode();
+const isCostTpl = biz && Number(tpl.card_id) >= 10000;
+if (biz) {
+curTaxRate = Number(tpl.tax_rate || 0);
+curInvoiceFlag = Number(tpl.invoice_flag || 0);
+curSettlementStatus = (tpl.settlement_status === 'UNPAID') ? 'UNPAID' : 'PAID';
+curDueDate = tpl.due_date || '';
+selCardId = isCostTpl ? Number(tpl.card_id) : null;
+setBizEntryKind(isCostTpl ? 'COST' : 'SALE');
+} else {
+setInputEntryType(tpl.entry_type || 'EXPENSE');
+}
+const amtEl = document.getElementById('amount');
+if (amtEl) amtEl.value = tpl.price > 0 ? String(tpl.price) : '';
+selCId = tpl.category_id > 0 ? Number(tpl.category_id) : null;
+selTIds = new Set(tpl.tag_ids ? String(tpl.tag_ids).split(',').filter(Boolean).map(Number) : []);
+const memoEl = document.getElementById('itemName');
+if (memoEl) memoEl.value = tpl.name || '';
+if (tpl.name) {
+isMemoOpen = true;
+document.getElementById('memoArea').style.display = 'block';
+document.getElementById('memoToggleBtn').innerText = 'メモ ×';
+} else {
+isMemoOpen = false;
+document.getElementById('memoArea').style.display = 'none';
+document.getElementById('memoToggleBtn').innerText = 'メモ ＋';
+}
+if (!biz) {
+if (curEntryType === 'EXPENSE' && tpl.card_id > 0) {
+isCard = true;
+selCardId = Number(tpl.card_id);
+document.getElementById('points').value = tpl.points > 0 ? String(tpl.points) : '';
+document.getElementById('cardBtn')?.classList.add('on');
+document.getElementById('pointSection').style.display = 'block';
+const ptsW = document.getElementById('points-input-wrap');
+if (ptsW) ptsW.style.display = 'block';
+} else {
+isCard = false;
+selCardId = null;
+document.getElementById('points').value = '';
+document.getElementById('cardBtn')?.classList.remove('on');
+document.getElementById('pointSection').style.display = 'none';
+}
+}
+refresh();
+showToast(`「${tpl.title}」を呼び出しました`);
+}
+function saveCurrentAsTemplate() {
+const amt = parseInt(document.getElementById('amount')?.value || '0', 10) || 0;
+const memo = document.getElementById('itemName')?.value?.trim() || '';
+const cats = JSON.parse(DB.getMaster('categories') || '[]');
+const catObj = cats.find(c => c.id === selCId);
+const suggest = memo || (catObj ? catObj.name : '定型入力');
+showModal(
+'定型入力を登録',
+`<div style="font-size:12px;color:#64748b;margin-bottom:6px;">ボタンに表示するタイトルを入力してください</div>` +
+`<div style="font-size:11px;color:#475569;">カテゴリ: ${_escHtml(catObj?.name || '未選択')} / 金額: ¥${amt.toLocaleString()}</div>`,
+true,
+(title) => {
+const clean = String(title || '').trim();
+if (!clean) return;
+const biz = isBizMode();
+let tplCardId = 0;
+if (biz) {
+if (curBizEntryKind === 'COST') {
+tplCardId = selCardId || (typeof DB.ensureDefaultCostTag === 'function' ? DB.ensureDefaultCostTag() : 0);
+}
+} else if (curEntryType === 'EXPENSE' && isCard) {
+tplCardId = selCardId || 0;
+}
+const payload = {
+id: -1,
+title: clean,
+name: memo,
+price: amt,
+category_id: selCId || 0,
+tag_ids: Array.from(selTIds).join(','),
+card_id: tplCardId,
+points: (!biz && curEntryType === 'EXPENSE' && isCard) ? (parseInt(document.getElementById('points')?.value || '0', 10) || 0) : 0,
+entry_type: biz ? 'EXPENSE' : curEntryType,
+tax_rate: biz ? curTaxRate : 0,
+invoice_flag: biz ? curInvoiceFlag : 0,
+settlement_status: biz ? curSettlementStatus : 'PAID',
+due_date: (biz && curSettlementStatus === 'UNPAID') ? (document.getElementById('biz-due-date')?.value || curDueDate || '') : '',
+sort_order: _tplCache.length
+};
+DB.saveInputTemplate(JSON.stringify(payload));
+renderTemplateStrip();
+showToast(`定型「${clean}」を登録しました`);
+}
+);
+const inp = document.getElementById('m-input');
+if (inp) inp.value = suggest;
+}
+function openTemplateManagerModal() {
+if (typeof DB.getInputTemplates !== 'function') return;
+let list = [];
+try { list = JSON.parse(DB.getInputTemplates() || '[]'); } catch(e) {}
+const cats = JSON.parse(DB.getMaster('categories') || '[]');
+const catMap = {}; cats.forEach(c => { catMap[c.id] = c.name; });
+const body = list.length === 0
+? '<div style="text-align:center;color:#94a3b8;padding:18px;font-size:13px;">定型入力はまだありません。<br>入力画面の「＋定型」から登録できます。</div>'
+: `<div style="max-height:320px;overflow-y:auto;">` + list.map((t, idx) => `
+<div style="display:flex;align-items:center;gap:6px;padding:8px 0;border-bottom:1px solid #f1f5f9;">
+<div style="flex:1;min-width:0;">
+<div style="font-size:13px;font-weight:700;color:#1e293b;">${t.entry_type==='INCOME'?'[収入] ':''}${_escHtml(t.title)}</div>
+<div style="font-size:11px;color:#64748b;">${_escHtml(catMap[t.category_id] || '未選択')} / ¥${Number(t.price||0).toLocaleString()}</div>
+</div>
+<button onclick="vibe();moveInputTemplate(${t.id},-1)" style="background:#f1f5f9;border:1px solid #cbd5e1;border-radius:6px;padding:4px 7px;font-size:11px;" ${idx===0?'disabled':''}>↑</button>
+<button onclick="vibe();moveInputTemplate(${t.id},1)" style="background:#f1f5f9;border:1px solid #cbd5e1;border-radius:6px;padding:4px 7px;font-size:11px;" ${idx===list.length-1?'disabled':''}>↓</button>
+<button onclick="vibe();deleteInputTemplateItem(${t.id})" style="background:var(--danger);color:#fff;border:none;border-radius:6px;padding:5px 9px;font-size:11px;">消</button>
+</div>`).join('') + `</div>`;
+showModal('定型入力の管理', body, false, () => { renderTemplateStrip(); });
+}
+function moveInputTemplate(id, dir) {
+const list = JSON.parse(DB.getInputTemplates() || '[]');
+const idx = list.findIndex(t => Number(t.id) === Number(id));
+const swapIdx = idx + dir;
+if (idx < 0 || swapIdx < 0 || swapIdx >= list.length) return;
+const tmp = list[idx];
+list[idx] = list[swapIdx];
+list[swapIdx] = tmp;
+list.forEach((t, i) => {
+t.sort_order = i;
+DB.saveInputTemplate(JSON.stringify(t));
+});
+renderTemplateStrip();
+openTemplateManagerModal();
+}
+function deleteInputTemplateItem(id) {
+DB.deleteInputTemplate(id);
+renderTemplateStrip();
+openTemplateManagerModal();
 }
 
 // トグルを「目的の状態」に直接セットする内部ヘルパー
@@ -1386,7 +2006,9 @@ DB.setSetting('compareOn',       String(S.compareOn));
 DB.setSetting('cmpTargets',      S.cmpTargets.join(','));
 DB.setSetting('cmpPercent',      String(S.cmpPercent));
 DB.setSetting('bizMode',          String(S.bizMode));
+DB.setSetting('defaultTaxRate',   String(S.defaultTaxRate || '0'));
 settingsDirty = false;
+if (typeof initAccount === 'function') initAccount();
 } catch(e) { console.error('saveSettingsToDB:', e); }
 }
 
@@ -1620,6 +2242,8 @@ const p = pu.value;
 S.periodUnit = p;
 const row = document.getElementById('row-season-preset');
 if (row) row.style.display = (p==='SEASON') ? 'flex' : 'none';
+const advDet = document.getElementById('settings-adv-biz');
+if (advDet && p === 'SEASON') advDet.open = true;
 }
 // select/input の onchange から呼ばれるハンドラ
 // カード編集 or 経費編集 をモードで切り替え
@@ -1631,9 +2255,18 @@ function onBizModeChange() {
 const el = document.getElementById('set-biz-mode');
 if (!el) return;
 S.bizMode = el.value === 'true';
+if (acctInfo && Array.isArray(acctInfo.accounts)) {
+const cur = acctInfo.accounts.find(a => a.id === acctInfo.current);
+if (cur) cur.isBiz = S.bizMode;
+}
 markSettingsDirty();
 _applyBizModeUI();
+if (editId === -1) curTaxRate = S.bizMode ? (parseInt(S.defaultTaxRate, 10) || 0) : 0;
+_renderBizMetaUI();
+renderAcctHeader();
+renderAcctSettings();
 refresh();
+renderTemplateStrip();
 try { updateSummary(); } catch(e) {}
 try { renderInfoPanel(); } catch(e) {}
 if (document.getElementById('view-analytics')?.style.display !== 'none') renderAnalytics();
@@ -1644,6 +2277,10 @@ const el = document.getElementById(id); if (!el) return;
 if (id === 'set-period-unit')  { S.periodUnit  = el.value; toggleSettingUI(); }
 if (id === 'set-season-type')  { S.seasonType  = el.value; }
 if (id === 'set-simple-view')  { S.simpleView  = el.value; }
+if (id === 'set-default-tax')  {
+S.defaultTaxRate = el.value || '0';
+if (isBizMode() && editId === -1) { curTaxRate = parseInt(S.defaultTaxRate, 10) || 0; _renderBizMetaUI(); }
+}
 if (id === 'period-start-day-val') { S.periodStartDay = el.value; _updatePeriodPreview(); }
 if (id === 'base-budget')      { S.baseBudget   = el.value; }
 markSettingsDirty();
@@ -1683,16 +2320,47 @@ function openMasterEdit(table) {
 if (table === 'fixed_costs') { openFixedCostsEdit(); return; }
 let data = [];
 try { data = JSON.parse(DB.getMaster(table) || '[]'); } catch(e) { data = []; }
-let h = `<div style="max-height:300px;overflow-y:auto">` + data.map(item => `
+const showCatType = (table === 'categories' && !isBizMode());
+let h = `<div style="max-height:300px;overflow-y:auto">` + data.map(item => {
+const ct = item.cat_type || 'EXPENSE';
+const typeSel = showCatType
+? `<select id="m-type-${item.id}" style="padding:7px 4px;font-size:12px;border:1px solid #cbd5e1;border-radius:6px;background:#f8fafc;">` +
+  `<option value="EXPENSE"${ct==='EXPENSE'?' selected':''}>支出</option>` +
+  `<option value="INCOME"${ct==='INCOME'?' selected':''}>収入</option>` +
+  `<option value="BOTH"${ct==='BOTH'?' selected':''}>共通</option></select>`
+: '';
+return `
 <div style="display:flex;gap:5px;margin-bottom:10px;align-items:center;">
-<input type="text" value="${_escHtml(item.name)}" id="m-${item.id}" style="flex:1;padding:8px;font-size:14px;">
+<input type="text" value="${_escHtml(item.name)}" id="m-${item.id}" style="flex:1;min-width:0;padding:8px;font-size:14px;">
+${typeSel}
 <button onclick="vibe();handleMasterUpdate('${table}',${item.id})" style="background:var(--primary);color:white;border:none;padding:8px;border-radius:6px;">更</button>
 <button onclick="vibe();handleMasterDelete('${table}',${item.id})" style="background:var(--danger);color:white;border:none;padding:8px;border-radius:6px;">消</button>
-</div>`).join('') +
-`</div><button onclick="vibe();addM('${table}')" style="width:100%;padding:12px;background:var(--dark);color:white;border:none;border-radius:8px;margin-top:10px;">+ 追加</button>`;
+</div>`;
+}).join('') + `</div>`;
+const presetBtn = (table === 'cost_tags')
+? `<button onclick="vibe();addStandardCostTags()" style="width:100%;padding:10px;background:#eff6ff;color:#0984e3;border:1px solid #93c5fd;border-radius:8px;margin-top:8px;font-size:12px;font-weight:700;">📋 個人事業主の標準科目を一括追加</button>`
+: '';
+h += `${presetBtn}<button onclick="vibe();addM('${table}')" style="width:100%;padding:12px;background:var(--dark);color:white;border:none;border-radius:8px;margin-top:8px;">+ 追加</button>`;
 const _titles = { categories:'カテゴリ編集', custom_tags:'タグ編集', point_cards:'カード編集', cost_tags:'経費タグ編集' };
 const _title = _titles[table] || 'マスター編集';
 showModal(_title, h, false, () => { refresh(); if(table==='point_cards'||table==='cost_tags') refreshPointsCardUI(); });
+}
+
+function addStandardCostTags() {
+if (typeof DB === 'undefined') return;
+const std = ['消耗品費','通信費','旅費交通費','接待交際費','水道光熱費','地代家賃','広告宣伝費','外注工賃','新聞図書費','支払手数料','雑費'];
+let existing = [];
+try { existing = JSON.parse(DB.getMaster('cost_tags') || '[]'); } catch(e) {}
+const existingNames = new Set(existing.map(x => String(x.name || '').trim()));
+let added = 0;
+std.forEach(name => {
+if (!existingNames.has(name)) {
+DB.addMaster('cost_tags', name);
+added++;
+}
+});
+openMasterEdit('cost_tags');
+showToast(added > 0 ? `${added}件の標準経費科目を追加しました` : '標準科目はすべて登録済みです');
 }
 
 // 固定費専用編集UI（名前＋金額）
@@ -1737,40 +2405,165 @@ openFixedCostsEdit();
 }
 
 function handleMasterUpdate(table, id) {
-const n = document.getElementById(`m-${id}`).value;
-if (n) { DB.updateMaster(table, id, n); openMasterEdit(table); }
+const n = document.getElementById(`m-${id}`)?.value?.trim();
+if (!n) return;
+if (table === 'categories' && !isBizMode() && typeof DB.updateCategoryWithType === 'function') {
+const ct = document.getElementById(`m-type-${id}`)?.value || 'EXPENSE';
+DB.updateCategoryWithType(id, n, ct);
+} else {
+DB.updateMaster(table, id, n);
+}
+openMasterEdit(table);
 }
 function handleMasterDelete(table, id) {
 showModal('確認', '削除しますか？', false, (r) => { if(r) { DB.deleteMaster(table,id); openMasterEdit(table); } });
 }
 function addM(table) {
+if (table === 'categories' && !isBizMode() && typeof DB.insertCategoryWithType === 'function') {
+const defType = curEntryType === 'INCOME' ? 'INCOME' : 'EXPENSE';
+const typeHtml = `<div style="margin-top:10px;display:flex;gap:6px;align-items:center;">` +
+`<span style="font-size:12px;color:#64748b;">種別:</span>` +
+`<select id="m-add-cat-type" style="flex:1;padding:8px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px;">` +
+`<option value="EXPENSE"${defType==='EXPENSE'?' selected':''}>支出</option>` +
+`<option value="INCOME"${defType==='INCOME'?' selected':''}>収入</option>` +
+`<option value="BOTH">共通</option></select></div>`;
+showModal("カテゴリ新規追加", "名前を入力してください" + typeHtml, true, (n) => {
+const clean = String(n || '').trim();
+if (!clean) return;
+const ct = document.getElementById('m-add-cat-type')?.value || 'EXPENSE';
+DB.insertCategoryWithType(clean, ct);
+openMasterEdit(table);
+});
+return;
+}
 showModal("新規追加", "名前を入力", true, (n) => { if(n) { DB.addMaster(table,n); openMasterEdit(table); } });
 }
 
 // ===== 保存 =====
+function _buildBudgetAlertSuffix(catId, recordDate) {
+if (isBizMode() || !recordDate) return '';
+try {
+const period = getCurrentPeriod();
+if (recordDate < period.from || recordDate > period.to) return '';
+const alerts = [];
+if (typeof DB.getCategoryBudgets === 'function') {
+const catBuds = JSON.parse(DB.getCategoryBudgets(period.from) || '[]');
+const target = catBuds.find(c => Number(c.categoryId) === Number(catId));
+if (target && target.amount > 0) {
+const cs = JSON.parse(DB.getCategoryStats(JSON.stringify({ dateFrom: period.from, dateTo: period.to, categoryIds: [catId], entryType: 'EXPENSE' })) || '[]');
+const spent = cs.reduce((s, r) => s + Number(r.amount || 0), 0);
+const pct = Math.round(spent / target.amount * 100);
+if (pct >= 100) alerts.push(`${target.catName}予算超過(${pct}%)`);
+else if (pct >= 80) alerts.push(`${target.catName}予算${pct}%`);
+}
+}
+if (typeof DB.getBudgetForPeriod === 'function') {
+const bi = JSON.parse(DB.getBudgetForPeriod(period.from, period.to) || '{}');
+const totalBud = Number(bi.totalAmount ?? -1);
+if (totalBud > 0) {
+const expTot = Number(DB.getTotalByRange(period.from, period.to) || 0);
+const fixedTot = _getPeriodFixedTotal(period);
+const effBud = (S.fixedOn && S.fixedMode === 'BUDGET') ? Math.max(0, totalBud - fixedTot) : totalBud;
+const effExp = (S.fixedOn && S.fixedMode === 'ADD') ? (expTot + fixedTot) : expTot;
+if (effBud > 0) {
+const mPct = Math.round(effExp / effBud * 100);
+if (mPct >= 100) alerts.push(`月予算超過(${mPct}%)`);
+else if (mPct >= 80) alerts.push(`月予算${mPct}%`);
+}
+}
+}
+return alerts.length ? ` ⚠️${alerts.join(' / ')}` : '';
+} catch(e) { return ''; }
+}
+
 function saveData() {
 const a = document.getElementById('amount').value;
-if (!a || !selCId) return showModal("エラー", "金額とカテゴリは必須です", false);
+const priceVal = parseInt(a, 10);
+if (!a || isNaN(priceVal) || !selCId) return showModal("エラー", "金額とカテゴリは必須です", false);
+const biz = isBizMode();
+const entryType = biz ? 'EXPENSE' : curEntryType;
+
+let finalCardId = 0;
+if (biz) {
+if (curBizEntryKind === 'COST') {
+let costTags = [];
+try { costTags = JSON.parse(DB.getMaster('cost_tags') || '[]'); } catch(e) {}
+const costIdSet = new Set(costTags.map(t => Number(t.id)));
+if (selCardId && costIdSet.has(Number(selCardId))) {
+finalCardId = Number(selCardId);
+} else if (typeof DB.ensureDefaultCostTag === 'function') {
+finalCardId = DB.ensureDefaultCostTag();
+} else if (costTags.length > 0) {
+finalCardId = Number(costTags[0].id);
+}
+} else {
+finalCardId = 0;
+}
+} else {
+finalCardId = (entryType === 'EXPENSE' && isCard) ? (selCardId || 0) : 0;
+}
+
+const dueVal = (biz && curSettlementStatus === 'UNPAID')
+? (document.getElementById('biz-due-date')?.value || curDueDate || '')
+: '';
+
 const payload = {
 id: editId,
 name: document.getElementById('itemName').value,
-price: parseInt(a),
+price: priceVal,
 category_id: selCId,
 tag_ids: Array.from(selTIds).join(','),
 date: document.getElementById('date').value,
-points: document.getElementById('points').value || "0",
-card_id: isCard ? (selCardId || 0) : 0,
+points: (!biz && entryType === 'EXPENSE') ? (document.getElementById('points').value || "0") : "0",
+card_id: finalCardId,
+entry_type: entryType,
+tax_rate: biz ? curTaxRate : 0,
+invoice_flag: biz ? curInvoiceFlag : 0,
+settlement_status: biz ? curSettlementStatus : 'PAID',
+due_date: dueVal,
 created_at: originalCreatedAt
 };
 const _sdDate = payload.date ? payload.date.slice(0, 7) : '';
+const isUpdate = editId > 0;
+const prevRec = (isUpdate && _histRecordMap[editId]) ? Object.assign({}, _histRecordMap[editId]) : null;
+const savedCatId = selCId;
+
 _checkStartMonthGuard(_sdDate, () => {
-if (DB.save(JSON.stringify(payload))) {
+const savedId = (typeof DB.saveAndReturnId === 'function')
+? Number(DB.saveAndReturnId(JSON.stringify(payload)))
+: (DB.save(JSON.stringify(payload)) ? (isUpdate ? editId : 0) : -1);
+if (savedId >= 0) {
 _clearEarliestDateCache();
-// 初回支出検知: appStartMonth 未設定かつ保存後の月次データが1件のみ
+if (!isUpdate && savedId > 0) {
+_lastSaveSnapshot = { mode: 'INSERT', newId: savedId };
+} else if (isUpdate && prevRec) {
+_lastSaveSnapshot = {
+mode: 'UPDATE',
+prevRecord: {
+id: Number(prevRec.id),
+name: prevRec.name || '',
+price: Number(prevRec.price || 0),
+category_id: Number(prevRec.category_id || 0),
+tag_ids: prevRec.tag_ids || '',
+date: prevRec.date || '',
+points: String(prevRec.points || 0),
+card_id: Number(prevRec.card_id || 0),
+entry_type: prevRec.entry_type || 'EXPENSE',
+tax_rate: Number(prevRec.tax_rate || 0),
+invoice_flag: Number(prevRec.invoice_flag || 0),
+settlement_status: prevRec.settlement_status || 'PAID',
+due_date: prevRec.due_date || '',
+created_at: prevRec.created_at || ''
+}
+};
+} else {
+_lastSaveSnapshot = null;
+}
+// 初回記録検知
 let _isFirstEntry = false;
 if (!S.appStartMonth && payload.date) {
 try {
-const _monthly = JSON.parse(DB.getMonthlyStatsFiltered(120, '{}'));
+const _monthly = JSON.parse(DB.getMonthlyStatsFiltered(120, JSON.stringify({ entryType: 'ALL' })));
 const _withData = _monthly.filter(m => (m.total || 0) > 0);
 _isFirstEntry = _withData.length === 1;
 } catch(e) {}
@@ -1786,16 +2579,23 @@ _updateStartMonthDisplay();
 const [, _mm, _dd] = payload.date.split('-');
 const _dateLabel = parseInt(_mm) + '月' + parseInt(_dd) + '日';
 const _ymLabel   = parseInt(_ym.slice(0,4)) + '年' + parseInt(_ym.slice(5)) + '月';
+const kindLabel = biz ? (curBizEntryKind === 'COST' ? '経費' : '売上') : (entryType === 'INCOME' ? '収入' : '支出');
 showModal(
 'ダウンロードありがとうございます！',
-_dateLabel + ' の支出を記録しました。<br><br>' +
+_dateLabel + ` の${kindLabel}を記録しました。<br><br>` +
 '<strong>' + _ymLabel + '</strong> を利用開始月として登録しました。<br><br>' +
 '<span style="font-size:12px;color:#64748b;">設定画面の「利用開始月」からいつでも変更できます。</span>',
 false,
 () => { clearForm(); updateSummary(); renderInfoPanel(); nav('input'); }
 );
 } else {
-showModal("完了", "保存しました", false, () => { clearForm(); updateSummary(); renderInfoPanel(); nav('input'); });
+const alertSuffix = (entryType === 'EXPENSE' && !biz) ? _buildBudgetAlertSuffix(savedCatId, payload.date) : '';
+const baseMsg = isUpdate ? '更新しました' : (biz ? (curBizEntryKind === 'COST' ? '経費を保存しました' : '売上を保存しました') : (entryType === 'INCOME' ? '収入を保存しました' : '保存しました'));
+clearForm();
+updateSummary();
+renderInfoPanel();
+nav('input');
+showToast(baseMsg + alertSuffix, _lastSaveSnapshot ? '元に戻す' : '', _lastSaveSnapshot ? undoLastSave : null);
 }
 } else {
 showModal("エラー", "保存に失敗しました。", false);
@@ -1808,14 +2608,21 @@ document.getElementById('amount').value = "";
 document.getElementById('itemName').value = "";
 document.getElementById('points').value = "";
 selCId=null; selTIds.clear(); selCardId=null; isCard=false; editId=-1; originalCreatedAt="";
-const cardBtn = document.getElementById('cardBtn');
-if (cardBtn) {
-cardBtn.classList.remove('on');
-cardBtn.textContent = isBizMode() ? '経費' : 'CARD';
-}
-document.getElementById('pointSection').style.display = 'none';
-const _ptsWrap = document.getElementById('points-input-wrap');
-if (_ptsWrap) _ptsWrap.style.display = 'none';
+curEntryType = 'EXPENSE';
+curBizEntryKind = 'SALE';
+curTaxRate = isBizMode() ? (parseInt(S.defaultTaxRate, 10) || 0) : 0;
+curInvoiceFlag = 0;
+curSettlementStatus = 'PAID';
+curDueDate = '';
+const suggestRow = document.getElementById('memo-suggest-row');
+if (suggestRow) { suggestRow.style.display = 'none'; suggestRow.innerHTML = ''; }
+_calcOpen = false;
+_calcExpr = '';
+const cBar = document.getElementById('calc-bar');
+if (cBar) cBar.style.display = 'none';
+document.getElementById('calc-toggle-btn')?.classList.remove('on');
+_updateCalcDisp();
+_applyEntryTypeUI();
 document.getElementById('save-btn').innerText = "保存";
 isMemoOpen=false;
 document.getElementById('memoArea').style.display = 'none';
@@ -1825,7 +2632,7 @@ resetDate(); refresh();
 
 // ===== ナビ =====
 function nav(m) {
-// 予算未設定ブロック（EXP以外の設定で予算未設定のまま設定タブ以外へ移動しようとした場合）
+// 予算未設定ブロック（REMAIN/BOTH時に予算未設定のまま他タブへ移動しようとした場合）
 if (m !== 'settings') {
 let hasBudget = false;
 try {
@@ -1838,7 +2645,7 @@ hasBudget    = info.totalAmount >= 0;
 hasBudget = (parseInt(S.baseBudget) || 0) >= 0 && S.baseBudget !== '';
 }
 } catch(e) {}
-if (S.simpleView !== 'EXP' && !hasBudget) {
+if ((S.simpleView === 'REMAIN' || S.simpleView === 'BOTH') && !hasBudget) {
 showModal(
 '⚠️ 基本月予算が未設定です',
 '現在の表示設定には予算額が必要です。<br><br>' +
@@ -1872,6 +2679,7 @@ showModal("確認", "選択を解除しますか？", false, (r) => { if(r) { cl
 }
 
 function doNav(m) {
+document.body.classList.toggle('input-tab-active', m === 'input');
 document.getElementById('view-input').style.display     = (m==='input'     ? 'block' : 'none');
 document.getElementById('view-history').style.display   = (m==='history'   ? 'block' : 'none');
 document.getElementById('view-analytics').style.display = (m==='analytics' ? 'block' : 'none');
@@ -1881,9 +2689,10 @@ document.getElementById('nav-in').classList.toggle('active',  m==='input');
 document.getElementById('nav-hi').classList.toggle('active',  m==='history');
 document.getElementById('nav-an').classList.toggle('active',  m==='analytics');
 document.getElementById('nav-set').classList.toggle('active', m==='settings');
-if (m==='history')   { currentOffset=0; document.getElementById('displayArea').innerHTML=""; subTab(mode); }
+if (m==='history')   { currentOffset=0; document.getElementById('displayArea').innerHTML=""; doSubTab(mode); }
 if (m==='analytics') { renderAnalytics(); setTimeout(_fixSummaryScrollHeight, 80); }
-if (m==='input')     { renderInfoPanel(); }
+if (m==='input')     { renderInfoPanel(); renderTemplateStrip(); }
+if (m==='settings')  { checkBackupReminder(); }
 updateFab();
 }
 
@@ -1894,12 +2703,213 @@ showModal("確認", "選択を解除して切り替えますか？", false, (r) 
 }
 
 function doSubTab(m) {
-mode=m; currentOffset=0; document.getElementById('displayArea').innerHTML="";
-document.getElementById('tab-save').classList.toggle('active',   m==='SAVE');
-document.getElementById('tab-delete').classList.toggle('active', m==='DELETE');
-// タブ切替で検索状態もクリア
-if (searchMode) clearSearch(); else loadMore();
+mode=m; currentOffset=0;
+const dispEl = document.getElementById('displayArea');
+const moreBtn = document.getElementById('loadMoreBtn');
+const calWrap = document.getElementById('cal-view-wrap');
+if (dispEl) dispEl.innerHTML="";
+document.getElementById('tab-save').classList.toggle('active',     m==='SAVE');
+document.getElementById('tab-calendar')?.classList.toggle('active', m==='CALENDAR');
+document.getElementById('tab-delete').classList.toggle('active',   m==='DELETE');
+
+if (m === 'CALENDAR') {
+if (searchMode && !_skipClearSearchOnce) {
+searchMode = false;
+searchFilter = {
+entryType:'ALL', bizKind:'ALL', settlementStatus:'ALL', categoryIds:[], tagIds:[], memo:'', cardIds:[],
+periodPreset:'ALL', dateFrom:'', dateTo:'',
+useCustom:false, useSort:false, sorts:[], isDeleteHistory:false
+};
+const ab = document.getElementById('srch-active-bar');
+if (ab) ab.style.display = 'none';
+const sb = document.getElementById('srch-summary-bar');
+if (sb) sb.style.display = 'none';
+document.getElementById('tab-search')?.classList.remove('active');
+}
+_skipClearSearchOnce = false;
+if (dispEl) dispEl.style.display = 'none';
+if (moreBtn) moreBtn.style.display = 'none';
+if (calWrap) calWrap.style.display = 'block';
+if (!calCurrentYm) calCurrentYm = _todayYmd().slice(0, 7);
+renderCalendarView(calCurrentYm);
+} else {
+if (calWrap) calWrap.style.display = 'none';
+if (dispEl) dispEl.style.display = 'block';
+if (searchMode && !_skipClearSearchOnce) {
+clearSearch();
+} else {
+_skipClearSearchOnce = false;
+if (searchMode) {
+const ab = document.getElementById('srch-active-bar');
+if (ab) ab.style.display = 'flex';
+document.getElementById('tab-search')?.classList.add('active');
+_updateSearchActiveChips();
+}
+loadMore();
+_renderSearchSummaryBar();
+}
+}
+_refreshUnpaidAlerts();
 updateFab();
+}
+
+// ===== カレンダー表示 =====
+function _fmtCalAmt(v) {
+const n = Number(v || 0);
+if (n >= 100000) return `${Math.round(n / 1000)}k`;
+return n.toLocaleString();
+}
+function renderCalendarView(ym) {
+if (typeof DB === 'undefined') return;
+const biz = isBizMode();
+if (!biz && typeof DB.getCalendarMonthSummary !== 'function') return;
+if (!ym) ym = _todayYmd().slice(0, 7);
+calCurrentYm = ym;
+const [y, m] = ym.split('-').map(Number);
+const lblEl = document.getElementById('cal-month-label');
+if (lblEl) lblEl.innerText = `${y}年${m}月`;
+
+let rows = [];
+try {
+if (biz && typeof DB.getBizCalendarMonthSummary === 'function') {
+rows = JSON.parse(DB.getBizCalendarMonthSummary(ym, JSON.stringify({})) || '[]');
+} else {
+rows = JSON.parse(DB.getCalendarMonthSummary(ym, JSON.stringify({})) || '[]');
+}
+} catch(e) { rows = []; }
+const dayMap = {};
+let totalExp = 0, totalInc = 0, totalSales = 0, totalCosts = 0;
+rows.forEach(r => {
+dayMap[r.date] = r;
+if (biz) {
+totalSales += Number(r.sales || 0);
+totalCosts += Number(r.costs || 0);
+} else {
+totalExp += Number(r.expense || 0);
+totalInc += Number(r.income || 0);
+}
+});
+
+const todayYmd = _todayYmd();
+const todayYm = todayYmd.slice(0, 7);
+const lastDay = _lastDayOfMonth(y, m);
+const limitDay = (ym < todayYm) ? lastDay : (ym === todayYm ? Number(todayYmd.slice(8, 10)) : 0);
+let noMoneyDays = 0;
+if (!biz) {
+for (let d = 1; d <= limitDay; d++) {
+const ds = `${ym}-${_pad2(d)}`;
+if (!dayMap[ds] || Number(dayMap[ds].expense || 0) === 0) noMoneyDays++;
+}
+}
+const nmdEl = document.getElementById('cal-nmd-badge');
+if (nmdEl) {
+if (!biz && limitDay > 0) {
+nmdEl.style.display = 'inline-block';
+nmdEl.innerText = `🌱 ノーマネーデー ${noMoneyDays}日`;
+} else {
+nmdEl.style.display = 'none';
+}
+}
+const totEl = document.getElementById('cal-month-totals');
+if (totEl) {
+if (biz) {
+const net = totalSales - totalCosts;
+totEl.innerHTML =
+`<span>売上 <b style="color:#0984e3;">¥${totalSales.toLocaleString()}</b></span>` +
+`<span>経費 <b style="color:#e17055;">¥${totalCosts.toLocaleString()}</b></span>` +
+`<span>純売上 <b style="color:${net>=0?'#00b894':'#dc2626'};">${net>=0?'':'−'}¥${Math.abs(net).toLocaleString()}</b></span>`;
+} else {
+const bal = totalInc - totalExp;
+totEl.innerHTML =
+`<span>支出 <b style="color:#dc2626;">¥${totalExp.toLocaleString()}</b></span>` +
+`<span>収入 <b style="color:#0984e3;">¥${totalInc.toLocaleString()}</b></span>` +
+`<span>収支 <b style="color:${bal>=0?'#0984e3':'#dc2626'};">${bal>=0?'+':'−'}¥${Math.abs(bal).toLocaleString()}</b></span>`;
+}
+}
+
+if (!calSelectedDate || !calSelectedDate.startsWith(ym)) {
+calSelectedDate = (ym === todayYm) ? todayYmd : `${ym}-01`;
+}
+
+const firstDow = new Date(y, m - 1, 1).getDay();
+const cells = [];
+for (let i = 0; i < firstDow; i++) cells.push('<div class="cal-cell empty"></div>');
+for (let d = 1; d <= lastDay; d++) {
+const ymd = `${ym}-${_pad2(d)}`;
+const info = dayMap[ymd];
+const isToday = ymd === todayYmd;
+const isSel = ymd === calSelectedDate;
+let valHtml = '';
+let dotHtml = '';
+if (biz && info) {
+const saleStr = info.sales > 0 ? `<span class="cal-day-sale">+¥${_fmtCalAmt(info.sales)}</span>` : '';
+const costStr = info.costs > 0 ? `<span class="cal-day-cost">-¥${_fmtCalAmt(info.costs)}</span>` : '';
+valHtml = saleStr + costStr;
+if (Number(info.unpaidCount || 0) > 0) dotHtml = '<span class="cal-unpaid-dot"></span>';
+} else if (!biz && info) {
+const expStr = info.expense > 0 ? `<span class="cal-day-exp">-¥${_fmtCalAmt(info.expense)}</span>` : '';
+const incStr = info.income > 0 ? `<span class="cal-day-inc">+¥${_fmtCalAmt(info.income)}</span>` : '';
+valHtml = expStr + incStr;
+}
+cells.push(
+`<div class="cal-cell${isToday?' today':''}${isSel?' selected':''}" data-ymd="${ymd}" onclick="vibe();selectCalendarDate('${ymd}')">` +
+`<span class="cal-day-num">${d}${dotHtml}</span>${valHtml}` +
+`</div>`
+);
+}
+const gridEl = document.getElementById('cal-grid');
+if (gridEl) gridEl.innerHTML = cells.join('');
+renderCalendarDayRecords(calSelectedDate);
+}
+function moveCalendarMonth(dir) {
+const cur = calCurrentYm || _todayYmd().slice(0, 7);
+let [y, m] = cur.split('-').map(Number);
+m += dir;
+if (m < 1) { m = 12; y--; }
+if (m > 12) { m = 1; y++; }
+calSelectedDate = '';
+renderCalendarView(`${y}-${_pad2(m)}`);
+}
+function selectCalendarDate(ymd) {
+calSelectedDate = ymd;
+document.querySelectorAll('#cal-grid .cal-cell[data-ymd]').forEach(el => {
+el.classList.toggle('selected', el.dataset.ymd === ymd);
+});
+renderCalendarDayRecords(ymd);
+}
+function renderCalendarDayRecords(ymd) {
+const container = document.getElementById('cal-day-records');
+if (!container || !ymd) return;
+const dObj = _parseYmd(ymd);
+const dowNames = ['日', '月', '火', '水', '木', '金', '土'];
+const dateTitle = `${dObj.getMonth() + 1}月${dObj.getDate()}日（${dowNames[dObj.getDay()]}）`;
+let all = [];
+try {
+let off = 0;
+while (true) {
+const chunk = JSON.parse(DB.searchRecords(JSON.stringify({
+periodPreset: 'CUSTOM', dateFrom: ymd, dateTo: ymd, useCustom: true, entryType: 'ALL', isDeleteHistory: false
+}), off) || '[]');
+all = all.concat(chunk);
+if (chunk.length < 20 || off >= 200) break;
+off += 20;
+}
+} catch(e) { all = []; }
+const headerHtml = `<div class="cal-day-header">` +
+`<span style="font-size:13px;font-weight:700;color:var(--dark);">${dateTitle}（${all.length}件）</span>` +
+`<button class="cal-jump-btn" onclick="vibe();jumpToInputWithDate('${ymd}')">＋ この日に入力</button>` +
+`</div>`;
+const listHtml = all.length === 0
+? `<div style="text-align:center;color:#94a3b8;padding:18px;font-size:12px;">この日の記録はありません</div>`
+: all.map(d => buildHistItem(d, true)).join('');
+container.innerHTML = headerHtml + listHtml;
+}
+function jumpToInputWithDate(ymd) {
+clearForm();
+const dateEl = document.getElementById('date');
+if (dateEl) dateEl.value = ymd;
+updateDateLabel(ymd);
+doNav('input');
 }
 
 // ===== 履歴読み込み =====
@@ -1917,7 +2927,7 @@ if (f.useCustom) { f.periodPreset = 'CUSTOM'; }
 if (!f.useSort) f.sorts = [];
 dataRaw = DB.searchRecords(JSON.stringify(f), currentOffset);
 } else {
-dataRaw = mode==='SAVE' ? DB.getRecords(currentOffset) : DB.getActionLogs('DELETE', currentOffset);
+dataRaw = mode==='DELETE' ? DB.getActionLogs('DELETE', currentOffset) : DB.getRecords(currentOffset);
 }
 const data = JSON.parse(dataRaw || "[]");
 if (data.length===0) {
@@ -1935,18 +2945,43 @@ document.getElementById('displayArea').innerHTML = "<p style='color:red;padding:
 }
 }
 
-function buildHistItem(d) {
-const item = mode==='SAVE' ? d : d.original;
+function buildHistItem(d, hideCheck) {
+const isDel = (mode === 'DELETE');
+const item = isDel ? d.original : d;
 if (!item) return "";
-if (mode === 'SAVE') _histRecordMap[d.id] = d;
+if (!isDel) _histRecordMap[d.id] = d;
 
+const biz = isBizMode();
 const dateDisplay = _escHtml((item.date || "2026-01-01").replace(/-/g, '/'));
 const tsRaw = item.created_at || '';
 const tsDisplay = formatCreatedAt(tsRaw);
 const tsHtml = tsDisplay ? `<span class="hist-ts">登録 ${_escHtml(tsDisplay)}</span>` : '';
+const isIncome = !biz && (item.entry_type === 'INCOME');
+const isCostTag = Number(d.is_cost_tag) === 1 || Number(item.card_id) >= 10000;
 
-// カテゴリ名
+// カテゴリ名・種別バッジ
 const catName = _escHtml(d.category || '未分類');
+let typeBadge = '';
+if (isIncome) {
+typeBadge = '<span class="hist-type-badge income">収入</span>';
+} else if (biz) {
+typeBadge = isCostTag
+? '<span class="hist-type-badge cost">経費</span>'
+: '<span class="hist-type-badge sale">売上</span>';
+}
+
+// 税区分・インボイス・未入金バッジ（売上管理モード時）
+let bizMetaHtml = '';
+if (biz) {
+const taxRate = Number(item.tax_rate || 0);
+if (taxRate === 10 || taxRate === 8) bizMetaHtml += `<span class="hist-type-badge tax">${taxRate}%</span>`;
+if (Number(item.invoice_flag || 0) === 1) bizMetaHtml += '<span class="hist-type-badge tax">適格</span>';
+if (item.settlement_status === 'UNPAID') {
+const isOverdue = !!(item.due_date && item.due_date < _todayYmd());
+const dueSub = item.due_date ? ' ' + _escHtml(item.due_date.slice(5).replace('-', '/')) : '';
+bizMetaHtml += `<span class="hist-type-badge unpaid${isOverdue ? ' overdue' : ''}">${isOverdue ? '期限超過' : (isCostTag ? '未払' : '未入金')}${dueSub}</span>`;
+}
+}
 
 // タグ：カンマ区切りのタグ名文字列
 const tagsHtml = d.tags
@@ -1954,11 +2989,14 @@ const tagsHtml = d.tags
 : '';
 
 // カード・ポイント / 経費タグ（支出額の下）
-const isCostTag = Number(d.is_cost_tag) === 1 || Number(item.card_id) >= 10000;
-const cardHtml = (item.card_id > 0)
+const cardHtml = (!isIncome && item.card_id > 0)
 ? (isCostTag
 ? `<span class="hist-card">🏷️ ${_escHtml(d.card || '経費')}</span>`
 : `<span class="hist-card">💳 ${_escHtml(d.card || 'カード')} +${item.points || 0}pt</span>`)
+: '';
+
+const settleBtnHtml = (!isDel && biz && item.settlement_status === 'UNPAID')
+? `<button type="button" class="hist-settle-btn" onclick="vibe();quickSettleRecord(${Number(d.id)},event)">✓ ${isCostTag ? '支払済にする' : '入金済にする'}</button>`
 : '';
 
 // 備考（入力がある場合のみ）
@@ -1966,13 +3004,19 @@ const memoHtml = item.name
 ? `<div class="hist-memo">📝 ${_escHtml(item.name)}</div>`
 : '';
 
-const clickHandler = mode==='SAVE'
+const clickHandler = !isDel
 ? `vibe();editRequestById(${Number(d.id)})`
 : '';
+const borderCol = isDel ? '#94a3b8' : (isIncome ? '#0984e3' : (biz && isCostTag ? '#e17055' : 'var(--primary)'));
+const pricePrefix = isIncome ? '+' : (biz ? (isCostTag ? '−' : '+') : '');
+const priceStr = `${pricePrefix}¥${parseInt(item.price||0).toLocaleString()}`;
+const priceCls = isIncome ? ' income' : (biz && isCostTag ? ' cost' : '');
+const catCls = isIncome ? ' income' : (biz && isCostTag ? ' cost' : '');
+const checkHtml = hideCheck ? '' : `<input type="checkbox" class="hist-check" onchange="toggleSel(${d.id},this.checked)" ${selItems.has(d.id)?'checked':''}>`;
 
 return `
-<div class="hist-item" style="border-left:4px solid ${mode==='SAVE'?'var(--primary)':'#94a3b8'}">
-<input type="checkbox" class="hist-check" onchange="toggleSel(${d.id},this.checked)" ${selItems.has(d.id)?'checked':''}>
+<div class="hist-item" style="border-left:4px solid ${borderCol}">
+${checkHtml}
 <div class="hist-content" onclick="${clickHandler}">
 <div class="hist-row">
 <div class="hist-left">
@@ -1981,14 +3025,15 @@ return `
 ${tsHtml}
 </div>
 <div class="hist-cat-tag-row">
-<span class="hist-cat-name">${catName}</span>
+${typeBadge}<span class="hist-cat-name${catCls}">${catName}</span>${bizMetaHtml}
 ${tagsHtml}
 </div>
 ${memoHtml}
 </div>
 <div class="hist-right">
-<span class="hist-price-main">¥${parseInt(item.price||0).toLocaleString()}</span>
+<span class="hist-price-main${priceCls}">${priceStr}</span>
 ${cardHtml}
+${settleBtnHtml}
 </div>
 </div>
 </div>
@@ -2014,7 +3059,7 @@ const s   = document.getElementById('select-count');
 const fab = document.getElementById('actionFab');
 // view-history が実際に表示されているかで判定
 const histView = document.getElementById('view-history');
-const isHist = histView && histView.style.display === 'block';
+const isHist = histView && histView.style.display === 'block' && mode !== 'CALENDAR';
 
 // 履歴タブ外またはselItemsが空なら必ず非表示
 if (!isHist || selItems.size === 0) {
@@ -2038,14 +3083,34 @@ fab.style.boxShadow = mode==='SAVE'
 function batchAction() {
 const ids = Array.from(selItems);
 const label = mode==='SAVE' ? '削除' : '復元';
-showModal("確認", `${ids.length}件を${label}しますか？`, false, (r) => {
+const unpaidIds = (isBizMode() && mode === 'SAVE')
+? ids.filter(id => _histRecordMap[id]?.settlement_status === 'UNPAID')
+: [];
+const settleBtnHtml = unpaidIds.length > 0
+? `<button type="button" onclick="vibe();closeModal();batchSettleIds([${unpaidIds.join(',')}])" style="width:100%;margin-top:10px;padding:10px;border:none;border-radius:10px;background:#00b894;color:#fff;font-size:13px;font-weight:700;cursor:pointer;">✓ 選択中の未入金を消込（${unpaidIds.length}件を入金済みに）</button>`
+: '';
+showModal("確認", `${ids.length}件を${label}しますか？${settleBtnHtml}`, false, (r) => {
 if (r) {
 if (mode==='SAVE') ids.forEach(id => DB.deleteLog(id));
 else DB.restoreLogs(JSON.stringify(ids));
 _clearEarliestDateCache();
-selItems.clear(); doSubTab(mode); updateSummary();
+selItems.clear();
+if (searchMode) { _skipClearSearchOnce = true; }
+doSubTab(mode);
+updateSummary();
 }
 });
+}
+
+function batchSettleIds(ids) {
+if (!ids || !ids.length || typeof DB === 'undefined' || typeof DB.markManyAsSettled !== 'function') return;
+const updated = DB.markManyAsSettled(JSON.stringify(ids));
+selItems.clear();
+if (searchMode) { _skipClearSearchOnce = true; }
+doSubTab(mode);
+updateSummary();
+renderInfoPanel();
+showToast(`${updated}件を入金済みに更新しました`);
 }
 
 function editRequestById(id) {
@@ -2054,11 +3119,40 @@ if (item) editRequest(item);
 }
 
 function editRequest(item) {
-showModal("編集", "編集画面へ移動しますか？", false, (r) => { if(r) fill(item); });
+const body = `<div style="margin-bottom:10px;font-size:13px;color:var(--dark);">編集画面へ移動しますか？</div>` +
+`<button onclick="vibe();closeModal();duplicateRecordById(${Number(item.id)})" ` +
+`style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px;background:#f8fafc;color:var(--dark);font-size:13px;font-weight:700;cursor:pointer;">📋 コピーして新規入力（今日）</button>`;
+showModal("編集", body, false, (r) => { if(r) fill(item); });
+}
+
+function duplicateRecordById(id) {
+const item = _histRecordMap[id];
+if (item) duplicateRecord(item);
+}
+
+function duplicateRecord(item) {
+fill(item);
+editId = -1;
+originalCreatedAt = '';
+resetDate();
+const saveBtn = document.getElementById('save-btn');
+if (saveBtn) saveBtn.innerText = '保存';
+showToast('コピーしました（日付は本日）');
 }
 
 function fill(item) {
-editId=parseInt(item.id); originalCreatedAt=item.created_at;
+editId=parseInt(item.id); originalCreatedAt=item.created_at || '';
+const biz = isBizMode();
+const isCostItem = Number(item.is_cost_tag) === 1 || Number(item.card_id) >= 10000;
+curEntryType = biz ? 'EXPENSE' : ((item.entry_type === 'INCOME') ? 'INCOME' : 'EXPENSE');
+if (biz) {
+curBizEntryKind = isCostItem ? 'COST' : 'SALE';
+curTaxRate = Number(item.tax_rate || 0);
+curInvoiceFlag = Number(item.invoice_flag || 0);
+curSettlementStatus = (item.settlement_status === 'UNPAID') ? 'UNPAID' : 'PAID';
+curDueDate = item.due_date || '';
+}
+_applyEntryTypeUI();
 document.getElementById('amount').value = item.price;
 document.getElementById('date').value = item.date; updateDateLabel(item.date);
 document.getElementById('itemName').value = item.name || "";
@@ -2073,16 +3167,22 @@ document.getElementById('memoToggleBtn').innerText='メモ ＋';
 }
 selCId=parseInt(item.category_id);
 selTIds=new Set(item.tag_ids ? item.tag_ids.split(',').filter(x=>x).map(Number) : []);
-isCard=(item.card_id>0); selCardId=isCard ? parseInt(item.card_id) : null;
-document.getElementById('points').value = item.points || "";
+if (biz) {
+isCard = isCostItem;
+selCardId = isCostItem ? parseInt(item.card_id) : null;
+document.getElementById('points').value = "";
+} else {
+isCard=(curEntryType === 'EXPENSE' && item.card_id>0); selCardId=isCard ? parseInt(item.card_id) : null;
+document.getElementById('points').value = isCard ? (item.points || "") : "";
+}
 const cardBtn = document.getElementById('cardBtn');
 if (cardBtn) {
 cardBtn.classList.toggle('on', isCard);
-cardBtn.textContent = isBizMode() ? '経費' : 'CARD';
+cardBtn.textContent = biz ? '経費' : 'CARD';
 }
 document.getElementById('pointSection').style.display = isCard ? 'block' : 'none';
 const _ptsWrap = document.getElementById('points-input-wrap');
-if (_ptsWrap) _ptsWrap.style.display = (isCard && !isBizMode()) ? 'block' : 'none';
+if (_ptsWrap) _ptsWrap.style.display = (isCard && !biz) ? 'block' : 'none';
 doNav('input');
 document.getElementById('save-btn').innerText = "更新/復元";
 refresh();
@@ -2093,6 +3193,9 @@ refresh();
 // ================================================================
 let searchMode   = false;   // 検索結果表示中か
 let searchFilter = {
+entryType:    'ALL',
+bizKind:      'ALL',
+settlementStatus: 'ALL',
 categoryIds:  [],
 tagIds:       [],
 memo:         '',
@@ -2129,9 +3232,37 @@ document.getElementById('search-modal').style.display = 'flex';
 }
 function closeSearch() { document.getElementById('search-modal').style.display = 'none'; }
 
+function setSrchEntryType(v) {
+searchFilter.entryType = v;
+document.querySelectorAll('#srch-entry-type-area .srch-chip').forEach(el => {
+el.classList.toggle('selected', el.dataset.v === v);
+});
+}
+function setSrchBizKind(v) {
+searchFilter.bizKind = v;
+document.querySelectorAll('#srch-biz-kind-area .srch-chip').forEach(el => {
+el.classList.toggle('selected', el.dataset.v === v);
+});
+}
+function setSrchSettlement(v) {
+searchFilter.settlementStatus = v;
+document.querySelectorAll('#srch-settlement-area .srch-chip').forEach(el => {
+el.classList.toggle('selected', el.dataset.v === v);
+});
+}
+
 // ---------- チップ描画 ----------
 function renderSrchChips() {
 if (typeof DB === 'undefined') return;
+document.querySelectorAll('#srch-entry-type-area .srch-chip').forEach(el => {
+el.classList.toggle('selected', el.dataset.v === (searchFilter.entryType || 'ALL'));
+});
+document.querySelectorAll('#srch-biz-kind-area .srch-chip').forEach(el => {
+el.classList.toggle('selected', el.dataset.v === (searchFilter.bizKind || 'ALL'));
+});
+document.querySelectorAll('#srch-settlement-area .srch-chip').forEach(el => {
+el.classList.toggle('selected', el.dataset.v === (searchFilter.settlementStatus || 'ALL'));
+});
 try {
 const cats  = JSON.parse(DB.getMaster('categories')  || '[]');
 const tags  = JSON.parse(DB.getMaster('custom_tags') || '[]');
@@ -2264,6 +3395,16 @@ searchFilter.memo     = document.getElementById('srch-memo').value.trim();
 searchFilter.dateFrom = document.getElementById('srch-date-from').value;
 searchFilter.dateTo   = document.getElementById('srch-date-to').value;
 closeSearch();
+if (mode === 'CALENDAR') {
+mode = 'SAVE';
+document.getElementById('tab-save')?.classList.add('active');
+document.getElementById('tab-calendar')?.classList.remove('active');
+document.getElementById('tab-delete')?.classList.remove('active');
+const cw = document.getElementById('cal-view-wrap');
+if (cw) cw.style.display = 'none';
+const da = document.getElementById('displayArea');
+if (da) da.style.display = 'block';
+}
 searchMode = true;
 currentOffset = 0;
 document.getElementById('displayArea').innerHTML = '';
@@ -2271,18 +3412,24 @@ document.getElementById('srch-active-bar').style.display = 'flex';
 // アクティブバーのチップ更新
 _updateSearchActiveChips();
 document.getElementById('tab-search').classList.add('active');
+_renderSearchSummaryBar();
 loadMore();
 }
 
 function clearSearch() {
 searchMode = false;
 searchFilter = {
+entryType:'ALL',
+bizKind:'ALL',
+settlementStatus:'ALL',
 categoryIds:[], tagIds:[], memo:'', cardIds:[],
 periodPreset:'ALL', dateFrom:'', dateTo:'',
 useCustom:false, useSort:false, sorts:[],
 isDeleteHistory: (mode === 'DELETE')
 };
 document.getElementById('srch-active-bar').style.display = 'none';
+const sumBar = document.getElementById('srch-summary-bar');
+if (sumBar) sumBar.style.display = 'none';
 document.getElementById('tab-search').classList.remove('active');
 currentOffset = 0;
 document.getElementById('displayArea').innerHTML = '';
@@ -2290,6 +3437,9 @@ loadMore();
 }
 
 function resetSearch() {
+searchFilter.entryType    = 'ALL';
+searchFilter.bizKind      = 'ALL';
+searchFilter.settlementStatus = 'ALL';
 searchFilter.categoryIds  = [];
 searchFilter.tagIds       = [];
 searchFilter.memo         = '';
@@ -2301,6 +3451,54 @@ searchFilter.useCustom    = false;
 searchFilter.useSort      = false;
 searchFilter.sorts        = [];
 renderSrchChips();
+}
+
+function _renderSearchSummaryBar() {
+const bar = document.getElementById('srch-summary-bar');
+if (!bar) return;
+if (!searchMode || mode === 'CALENDAR' || typeof DB === 'undefined' || typeof DB.getSearchSummary !== 'function') {
+bar.style.display = 'none';
+return;
+}
+try {
+const f = Object.assign({}, searchFilter, { isDeleteHistory: mode === 'DELETE' });
+if (f.useCustom) f.periodPreset = 'CUSTOM';
+const sum = JSON.parse(DB.getSearchSummary(JSON.stringify(f)) || '{}');
+const cnt = Number(sum.count || 0);
+const exp = Number(sum.totalExpense || 0);
+const inc = Number(sum.totalIncome || 0);
+const avg = Number(sum.avgPrice || 0);
+const pts = Number(sum.totalPoints || 0);
+const parts = [`<span>該当 <b>${cnt.toLocaleString()}件</b></span>`];
+if (isBizMode()) {
+const sales = Number(sum.totalSales || 0);
+const costs = Number(sum.totalCosts || 0);
+const net = Number(sum.netSales ?? (sales - costs));
+const unpaid = Number(sum.unpaidSales || 0);
+parts.push(`<span>売上計 <b style="color:#0984e3;">¥${sales.toLocaleString()}</b></span>`);
+parts.push(`<span>経費計 <b style="color:#e17055;">¥${costs.toLocaleString()}</b></span>`);
+parts.push(`<span>純売上 <b style="color:${net>=0?'#00b894':'#dc2626'};">${net>=0?'':'−'}¥${Math.abs(net).toLocaleString()}</b></span>`);
+if (unpaid > 0) parts.push(`<span>未入金 <b style="color:#d97706;">¥${unpaid.toLocaleString()}</b></span>`);
+} else {
+if (searchFilter.entryType === 'INCOME') {
+parts.push(`<span>収入計 <b style="color:#0984e3;">¥${inc.toLocaleString()}</b></span>`);
+} else if (searchFilter.entryType === 'EXPENSE') {
+parts.push(`<span>支出計 <b>¥${exp.toLocaleString()}</b></span>`);
+} else {
+parts.push(`<span>支出 <b>¥${exp.toLocaleString()}</b></span>`);
+if (inc > 0) parts.push(`<span>収入 <b style="color:#0984e3;">¥${inc.toLocaleString()}</b></span>`);
+}
+}
+if (cnt > 0 && !isBizMode()) parts.push(`<span>平均 <b>¥${avg.toLocaleString()}</b></span>`);
+if (!isBizMode() && pts > 0) parts.push(`<span>Pt <b>+${pts.toLocaleString()}</b></span>`);
+const csvBtn = (mode !== 'DELETE' && cnt > 0)
+? `<button class="srch-csv-mini-btn" onclick="vibe();doExportCsv(true)">CSV出力</button>`
+: '';
+bar.innerHTML = `<div class="srch-summary-metrics">${parts.join('')}</div>${csvBtn}`;
+bar.style.display = 'flex';
+} catch(e) {
+bar.style.display = 'none';
+}
 }
 
 // ================================================================
@@ -2381,9 +3579,66 @@ const fixedRows = fixedItems.length === 0
 `<div class="bm-item"><div class="bm-item-name">${_escHtml(f.name)}</div><div class="bm-item-amount">¥ ${f.amount.toLocaleString()}</div><button onclick="vibe();bmEditFixed(${f.id},'${_escJsAttr(f.name)}',${f.amount},'${_escJsAttr(f.validFrom)}')" class="bm-item-edit">編集</button><button onclick="vibe();bmDeleteFixed(${f.id},'${_escJsAttr(f.name)}')" class="bm-item-del">削除</button></div>`
 ).join('');
 
+const catBudSection = (!isBizMode() && typeof DB.getCategoryBudgets === 'function')
+? (() => {
+let catBuds = [];
+try { catBuds = JSON.parse(DB.getCategoryBudgets(_bmPeriodFrom) || '[]'); } catch(e) {}
+const expCats = catBuds.filter(c => (c.catType || 'EXPENSE') !== 'INCOME');
+const catSum = expCats.reduce((s, c) => s + (Number(c.amount) || 0), 0);
+const catRows = expCats.map(c =>
+`<div class="bm-item">` +
+`<div class="bm-item-name">${_escHtml(c.catName)}</div>` +
+`<input type="number" class="bm-cat-bud-inp" data-cat-id="${c.categoryId}" value="${c.amount > 0 ? c.amount : ''}" placeholder="未設定" style="width:110px;padding:6px 8px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px;text-align:right;">` +
+`<span style="font-size:12px;color:#64748b;">円</span>` +
+`</div>`
+).join('');
+return `<details class="bm-section"><summary class="bm-section-title" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;margin-bottom:0;"><span>カテゴリ別予算</span><span style="font-size:12px;color:var(--primary);">設定計 ¥${catSum.toLocaleString()} ▼</span></summary>` +
+`<div style="margin-top:10px;">` +
+`<div style="display:flex;justify-content:flex-end;margin-bottom:6px;"><button onclick="vibe();bmCopyPrevCatBudgets()" class="bm-btn-add" style="font-size:12px;">前期間からコピー</button></div>` +
+catRows +
+`<button onclick="vibe();bmSaveCatBudgets()" class="bm-btn-primary" style="width:100%;margin-top:10px;">カテゴリ別予算を保存</button>` +
+`</div></details>`;
+})()
+: '';
+
+const seasonBreakdownSection = (S.periodUnit === 'SEASON' && _bmPeriodFrom && _bmPeriodTo)
+? (() => {
+const bmBiz = isBizMode();
+const anchor = parseInt(S.periodStartDay) || 25;
+const mRows = [];
+if (S.closingOn) {
+let cur = _calcClosingPeriodForDate(_parseYmd(_bmPeriodFrom), anchor);
+for (let i = 0; i < 15 && cur.from <= _bmPeriodTo; i++) {
+const val = bmBiz ? _getBizNetSummary(cur.from, cur.to).netSales : (DB.getTotalByRange(cur.from, cur.to) || 0);
+mRows.push({ label: `${cur.closeM}月期 (${cur.from.slice(5)}〜${cur.to.slice(5)})`, val });
+cur = _calcNextClosingPeriod(cur.to, anchor);
+}
+} else {
+let cy = parseInt(_bmPeriodFrom.slice(0, 4), 10), cm = parseInt(_bmPeriodFrom.slice(5, 7), 10);
+const ey = parseInt(_bmPeriodTo.slice(0, 4), 10), em = parseInt(_bmPeriodTo.slice(5, 7), 10);
+while (cy < ey || (cy === ey && cm <= em)) {
+const mf = `${cy}-${_pad2(cm)}-01`;
+const mt = `${cy}-${_pad2(cm)}-${_pad2(_lastDayOfMonth(cy, cm))}`;
+const val = bmBiz ? _getBizNetSummary(mf, mt).netSales : (DB.getTotalByRange(mf, mt) || 0);
+mRows.push({ label: `${cy}/${cm}月`, val });
+cm++; if (cm > 12) { cm = 1; cy++; }
+}
+}
+const cumSum = mRows.reduce((s, r) => s + r.val, 0);
+const tgt = budgetInfo.totalAmount > 0 ? budgetInfo.totalAmount : 0;
+const pct = tgt > 0 ? Math.round((cumSum / tgt) * 100) : null;
+const rowsHtml = mRows.map(r =>
+`<div class="bm-item" style="padding:5px 0;"><div class="bm-item-name">${_escHtml(r.label)}</div><div class="bm-item-amount">${r.val<0?'−':''}¥ ${Math.abs(r.val).toLocaleString()}</div></div>`
+).join('');
+return `<details class="bm-section"><summary class="bm-section-title" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;margin-bottom:0;"><span>シーズン月別内訳</span><span style="font-size:12px;color:var(--primary);">累計 ¥${cumSum.toLocaleString()}${pct!==null?' ('+pct+'%)':''} ▼</span></summary><div style="margin-top:8px;">${rowsHtml}</div></details>`;
+})()
+: '';
+
 content.innerHTML =
 `<div class="bm-section"><div class="bm-section-title">予算の更新方法</div><div style="display:flex;flex-direction:column;gap:6px;">${modeOpts}</div></div>` +
 `<div class="bm-section"><div class="bm-section-title">基本予算</div><div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;"><input type="number" id="bm-base-input" placeholder="0" value="${baseAmt >= 0 ? baseAmt : ''}" style="flex:1;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;font-size:16px;font-weight:600;"><span style="font-size:13px;color:#64748b;">円</span><button onclick="vibe();bmSaveBase()" class="bm-btn-primary">保存</button></div>${baseAmt < 0 ? '<div style="font-size:11px;color:#e67e22;margin-top:2px;">⚠️ この期間の予算が未設定です</div>' : ''}</div>` +
+seasonBreakdownSection +
+catBudSection +
 (() => {
 const _bmBiz = isBizMode();
 const _extraGray = _bmBiz ? 'opacity:0.38;pointer-events:none;user-select:none;' : '';
@@ -2393,39 +3648,57 @@ return `<div class="bm-section" style="${_extraGray}"><div class="bm-section-tit
 `<div class="bm-section"><div class="bm-section-title" style="display:flex;justify-content:space-between;align-items:center;"><span>固定費・定期支出</span><button onclick="vibe();bmAddFixed()" class="bm-btn-add">＋ 追加</button></div><div id="bm-fixed-list">${fixedRows}</div><div class="bm-total-row bm-total-grand"><span>固定費合計</span><span>¥ ${fixedTotal.toLocaleString()}</span></div></div>`;
 }
 
+function bmSaveCatBudgets() {
+if (typeof DB.setCategoryBudget !== 'function') return;
+document.querySelectorAll('.bm-cat-bud-inp').forEach(inp => {
+const cid = parseInt(inp.dataset.catId, 10);
+const val = Math.max(0, parseInt(inp.value || '0', 10) || 0);
+if (cid > 0) DB.setCategoryBudget(_bmPeriodFrom, cid, val);
+});
+_bmRender();
+showToast('カテゴリ別予算を保存しました');
+}
+
+function bmCopyPrevCatBudgets() {
+if (typeof DB.copyCategoryBudgets !== 'function') return;
+const prev = _bmCalcMovedPeriod(-1);
+DB.copyCategoryBudgets(prev.from, _bmPeriodFrom);
+_bmRender();
+showToast('前期間のカテゴリ別予算をコピーしました');
+}
+
 function _escQ(s) { return String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
 function _escJsAttr(s) { return _escHtml(_escQ(s)); }
 
 function bmPrevPeriod() { _bmMovePeriod(-1); }
 function bmNextPeriod() { _bmMovePeriod(+1); }
 
-function _bmMovePeriod(dir) {
+function _bmCalcMovedPeriod(dir) {
 const unit = S.periodUnit || 'MONTH';
 if (unit === 'WEEK') {
 const f = _parseYmd(_bmPeriodFrom); f.setDate(f.getDate() + dir * 7);
 const t = _parseYmd(_bmPeriodTo);   t.setDate(t.getDate() + dir * 7);
-_bmPeriodFrom = _ymd(f);
-_bmPeriodTo   = _ymd(t);
+return { from: _ymd(f), to: _ymd(t) };
 } else if (unit === 'YEAR') {
 const y = parseInt(_bmPeriodFrom.slice(0, 4)) + dir;
-_bmPeriodFrom = `${y}-01-01`;
-_bmPeriodTo   = `${y}-12-31`;
+return { from: `${y}-01-01`, to: `${y}-12-31` };
 } else if (unit === 'SEASON') {
 const anchor = parseInt(S.periodStartDay) || 25;
-const p = _calcSeasonPeriod(_parseYmd(_bmPeriodFrom), S.seasonType || 'Q', !!S.closingOn, anchor, dir);
-_bmPeriodFrom = p.from;
-_bmPeriodTo   = p.to;
+return _calcSeasonPeriod(_parseYmd(_bmPeriodFrom), S.seasonType || 'Q', !!S.closingOn, anchor, dir);
 } else if (S.closingOn) {
-const p = dir < 0 ? _calcPrevClosingPeriod(_bmPeriodFrom) : _calcNextClosingPeriod(_bmPeriodTo);
-_bmPeriodFrom = p.from;
-_bmPeriodTo   = p.to;
+return dir < 0 ? _calcPrevClosingPeriod(_bmPeriodFrom) : _calcNextClosingPeriod(_bmPeriodTo);
 } else {
 let ny = parseInt(_bmPeriodFrom.slice(0, 4)), nm = parseInt(_bmPeriodFrom.slice(5, 7)) + dir;
 if (nm < 1)  { nm += 12; ny--; }
 if (nm > 12) { nm -= 12; ny++; }
-_bmPeriodFrom = `${ny}-${_pad2(nm)}-01`;
-_bmPeriodTo   = `${ny}-${_pad2(nm)}-${_pad2(_lastDayOfMonth(ny, nm))}`;
+return { from: `${ny}-${_pad2(nm)}-01`, to: `${ny}-${_pad2(nm)}-${_pad2(_lastDayOfMonth(ny, nm))}` };
 }
+}
+
+function _bmMovePeriod(dir) {
+const p = _bmCalcMovedPeriod(dir);
+_bmPeriodFrom = p.from;
+_bmPeriodTo   = p.to;
 _bmRender();
 }
 
@@ -2560,20 +3833,81 @@ try { DB.endFixedCostHistory(id, endDate); _bmCloseSub(); _bmRender(); updateSum
 
 
 // ================================================================
-//  エクスポート・インポート
+//  エクスポート・インポート・バックアップリマインダー
 // ================================================================
+function checkBackupReminder() {
+const banner = document.getElementById('backup-reminder-banner');
+if (!banner || typeof DB === 'undefined') return;
+try {
+const lastAt = DB.getSetting('lastBackupAt', '') || '';
+const lastCnt = parseInt(DB.getSetting('lastBackupRecordCount', '0'), 10) || 0;
+let curCnt = 0;
+if (typeof DB.getSearchSummary === 'function') {
+const sum = JSON.parse(DB.getSearchSummary(JSON.stringify({ entryType: 'ALL' })) || '{}');
+curCnt = Number(sum.count || 0);
+}
+if (curCnt < 10) {
+banner.style.display = 'none';
+return;
+}
+let daysSince = 999;
+if (lastAt) {
+const d = new Date(lastAt.replace(' ', 'T'));
+if (!isNaN(d.getTime())) daysSince = Math.floor((Date.now() - d.getTime()) / 86400000);
+}
+const newRecords = curCnt - lastCnt;
+if (!lastAt || daysSince >= 14 || newRecords >= 30) {
+const reason = !lastAt
+? `現在 <b>${curCnt.toLocaleString()}件</b> の記録があります。まだバックアップが作成されていません。`
+: `前回のバックアップ（${_escHtml(lastAt.slice(0, 10))}）から <b>${daysSince}日</b>（新規 +${Math.max(0, newRecords)}件）が経過しています。`;
+banner.innerHTML =
+`<div>⚠️ ${reason}</div>` +
+`<button onclick="vibe();doExport()" style="margin-top:8px;background:#b45309;color:#fff;border:none;border-radius:8px;padding:7px 12px;font-size:12px;font-weight:700;cursor:pointer;">今すぐJSONバックアップを作成</button>`;
+banner.style.display = 'block';
+} else {
+banner.style.display = 'none';
+}
+} catch(e) {
+banner.style.display = 'none';
+}
+}
+
 function doExport() {
 showModal('エクスポート確認', '全データをJSONファイルに保存します。<br><small style="color:var(--text-sub);">保存先: Downloads/KakeiboBackup/アカウント名/</small>', false, (r) => {
 if (!r) return;
 try {
 const path = DB.exportToFile();
 if (path.startsWith('ERROR')) {
-showModal('エラー', 'エクスポートに失敗しました。<br>' + path, false);
+showModal('エラー', 'エクスポートに失敗しました。<br>' + _escHtml(path), false);
 } else {
-showModal('完了', `エクスポートしました。<br><br><span style="font-size:11px;word-break:break-all;color:var(--text-sub);">${path}</span>`, false);
+checkBackupReminder();
+showModal('完了', `エクスポートしました。<br><br><span style="font-size:11px;word-break:break-all;color:var(--text-sub);">${_escHtml(path)}</span>`, false);
 }
 } catch(e) {
-showModal('エラー', 'エクスポートに失敗しました。<br>' + e.message, false);
+showModal('エラー', 'エクスポートに失敗しました。<br>' + _escHtml(e.message), false);
+}
+});
+}
+
+function doExportCsv(useSearchFilter) {
+if (typeof DB === 'undefined' || typeof DB.exportCsvToFile !== 'function') return;
+const fObj = (useSearchFilter && searchMode)
+? Object.assign({}, searchFilter, { isDeleteHistory: false, bizMode: isBizMode() })
+: { entryType: 'ALL', bizMode: isBizMode() };
+if (fObj.useCustom) fObj.periodPreset = 'CUSTOM';
+if (!fObj.useSort) fObj.sorts = [];
+const scopeLabel = (useSearchFilter && searchMode) ? '絞込み条件に一致する記録' : '全記録';
+showModal('CSVエクスポート確認', `${scopeLabel}をCSVファイル（Excel/スプレッドシート対応）に保存します。<br><small style="color:var(--text-sub);">保存先: Downloads/KakeiboBackup/アカウント名/</small>`, false, (r) => {
+if (!r) return;
+try {
+const path = DB.exportCsvToFile(JSON.stringify(fObj));
+if (path.startsWith('ERROR')) {
+showModal('エラー', 'CSVエクスポートに失敗しました。<br>' + _escHtml(path), false);
+} else {
+showModal('完了', `CSVを保存しました。<br><br><span style="font-size:11px;word-break:break-all;color:var(--text-sub);">${_escHtml(path)}</span>`, false);
+}
+} catch(e) {
+showModal('エラー', 'CSVエクスポートに失敗しました。<br>' + _escHtml(e.message), false);
 }
 });
 }
@@ -2592,7 +3926,7 @@ if (!r) return;
 try {
 DB.openImportFilePicker();
 } catch(e) {
-showModal('エラー', 'ファイルピッカーを開けませんでした。<br>' + e.message, false);
+showModal('エラー', 'ファイルピッカーを開けませんでした。<br>' + _escHtml(e.message), false);
 }
 });
 }
@@ -2605,6 +3939,12 @@ const fileAcct   = _escHtml(meta.fileAccount    || '不明');
 const exportedAt = _escHtml(meta.exportedAt     || '不明');
 const count      = Number(meta.recordCount || 0);
 const curAcct    = _escHtml(meta.currentAccount || '不明');
+const rangeText  = (meta.minDate && meta.maxDate)
+? `${_escHtml(meta.minDate.replace(/-/g,'/'))} 〜 ${_escHtml(meta.maxDate.replace(/-/g,'/'))}`
+: '—';
+const extraNote  = (meta.hasTemplates || meta.hasCategoryBudgets)
+? `<div style="font-size:11px;color:#059669;margin-top:6px;">✓ 定型入力・カテゴリ別予算設定も含まれます</div>`
+: '';
 
 const isDiff = (meta.fileAccount || '不明') !== '不明' && meta.fileAccount !== meta.currentAccount;
 const warnHtml = isDiff
@@ -2625,13 +3965,18 @@ const body = `
 <b style="font-size:11px;">${exportedAt}</b>
 </div>
 <div style="display:flex;justify-content:space-between;border-bottom:1px solid #eee;padding-bottom:6px;margin-bottom:6px;">
-<span style="color:var(--text-sub);">データ件数</span>
+<span style="color:var(--text-sub);">データ件数 / 期間</span>
 <b>${count.toLocaleString()}件</b>
+</div>
+<div style="display:flex;justify-content:space-between;border-bottom:1px solid #eee;padding-bottom:6px;margin-bottom:6px;">
+<span style="color:var(--text-sub);">収録期間</span>
+<b style="font-size:11px;">${rangeText}</b>
 </div>
 <div style="display:flex;justify-content:space-between;padding-bottom:4px;">
 <span style="color:var(--text-sub);">上書き先</span>
 <b style="color:var(--danger);">${curAcct}</b>
 </div>
+${extraNote}
 ${warnHtml}
 </div>
 <div style="font-size:11px;color:var(--text-sub);margin-top:10px;">
@@ -2678,20 +4023,28 @@ updateFixedTotalBadge();
 _renderBmCurrentSummary();
 
 if (typeof refresh === 'function') refresh();
+if (typeof renderTemplateStrip === 'function') renderTemplateStrip();
 if (typeof updateSummary === 'function') updateSummary();
 if (typeof renderInfoPanel === 'function') renderInfoPanel();
 if (typeof refreshPointsCardUI === 'function') refreshPointsCardUI();
+if (typeof checkBackupReminder === 'function') checkBackupReminder();
 
 searchMode = false;
 selItems.clear();
+calSelectedDate = '';
 updateFab();
 document.getElementById('srch-active-bar').style.display = 'none';
+const sumBar = document.getElementById('srch-summary-bar');
+if (sumBar) sumBar.style.display = 'none';
 document.getElementById('tab-search').classList.remove('active');
 const histView = document.getElementById('view-history');
 if (histView && histView.style.display === 'block') {
+if (mode === 'CALENDAR') renderCalendarView(calCurrentYm);
+else {
 currentOffset = 0;
 document.getElementById('displayArea').innerHTML = '';
 loadMore();
+}
 }
 if (document.getElementById('view-analytics')?.style.display === 'block') renderAnalytics();
 if (typeof initAccount === 'function') initAccount();
@@ -2712,7 +4065,11 @@ renderAcctSettings();
 
 function renderAcctHeader() {
 const cur = acctInfo.accounts.find(a => a.id === acctInfo.current);
-if (cur) document.getElementById('acct-label').innerText = cur.name;
+const lbl = document.getElementById('acct-label');
+if (cur && lbl) {
+const isBiz = (cur.isBiz === true) || isBizMode();
+lbl.innerHTML = _escHtml(cur.name) + (isBiz ? '<span class="acct-biz-pill">事業</span>' : '');
+}
 }
 
 function renderAcctSettings() {
@@ -2720,10 +4077,12 @@ const list = document.getElementById('acct-settings-list');
 if (!list) return;
 list.innerHTML = acctInfo.accounts.map(a => {
 const isCur = a.id === acctInfo.current;
+const isBiz = (a.isBiz === true) || (isCur && isBizMode());
+const pill = isBiz ? '<span class="acct-biz-pill">事業</span>' : '';
 return `<div class="acct-setting-row ${isCur?'acct-setting-cur':''}">
 <div style="display:flex;align-items:center;gap:8px;flex:1;">
 <span class="acct-setting-dot ${isCur?'acct-dot-on':''}"></span>
-<span id="acct-name-disp-${a.id}" class="acct-name-text">${_escHtml(a.name)}</span>
+<span id="acct-name-disp-${a.id}" class="acct-name-text">${_escHtml(a.name)}${pill}</span>
 <input id="acct-name-input-${a.id}" class="acct-name-input" type="text"
 value="${_escHtml(a.name)}" style="display:none;"
 onblur="commitAcctName(${a.id})" onkeydown="if(event.key==='Enter')this.blur()">
@@ -2755,8 +4114,10 @@ if (dd.style.display === 'none') {
 const inner = document.getElementById('acct-dd-inner');
 inner.innerHTML = acctInfo.accounts.map(a => {
 const isCur = a.id === acctInfo.current;
+const isBiz = (a.isBiz === true) || (isCur && isBizMode());
+const pill = isBiz ? '<span class="acct-biz-pill">事業</span>' : '';
 return `<div class="acct-dd-item ${isCur?'acct-dd-cur':''}" onclick="vibe();${isCur?'closeAcctDropdown()':'confirmSwitchAccount('+a.id+')'}">
-${isCur ? '✓ ' : ''}${_escHtml(a.name)}
+${isCur ? '✓ ' : ''}${_escHtml(a.name)}${pill}
 </div>`;
 }).join('');
 dd.style.display = 'flex';
@@ -2861,14 +4222,18 @@ acctInfo = JSON.parse(infoJson);
 _applyInitialSettings();
 _clearEarliestDateCache();
 selItems.clear();
+calSelectedDate = '';
 currentOffset = 0;
 document.getElementById('displayArea').innerHTML = '';
 refresh();
+renderTemplateStrip();
 updateSummary();
 updateFixedTotalBadge();
 _renderBmCurrentSummary();
 renderInfoPanel();
 renderAcctSettings();
+checkBackupReminder();
+if (document.getElementById('view-history')?.style.display === 'block' && mode === 'CALENDAR') renderCalendarView(calCurrentYm);
 if (document.getElementById('view-analytics')?.style.display === 'block') renderAnalytics();
 showToast('アカウントをリセットしました');
 }
@@ -2881,10 +4246,13 @@ loadSettingsFromDB();
 _clearEarliestDateCache();
 anUseClosing = null;
 anPreset = 'MONTH';
+anEntryType = 'EXPENSE';
+anTrendMode = 'expense';
 anCatIds = [];
 anTagIds = [];
 anMemo = '';
 anPtsBreakdown = false;
+calSelectedDate = '';
 document.querySelectorAll('.an-period-chip').forEach(el =>
 el.classList.toggle('selected', el.dataset.v === 'MONTH'));
 const customArea = document.getElementById('an-custom-period');
@@ -2892,6 +4260,9 @@ if (customArea) customArea.style.display = 'none';
 _updateAnActiveChips();
 searchMode = false;
 searchFilter = {
+entryType:'ALL',
+bizKind:'ALL',
+settlementStatus:'ALL',
 categoryIds:[], tagIds:[], memo:'', cardIds:[],
 periodPreset:'ALL', dateFrom:'', dateTo:'',
 useCustom:false, useSort:false, sorts:[],
@@ -2899,22 +4270,31 @@ isDeleteHistory: (mode === 'DELETE')
 };
 const srchBar = document.getElementById('srch-active-bar');
 if (srchBar) srchBar.style.display = 'none';
+const sumBar = document.getElementById('srch-summary-bar');
+if (sumBar) sumBar.style.display = 'none';
 document.getElementById('tab-search')?.classList.remove('active');
 selItems.clear();
 currentOffset = 0;
 document.getElementById('displayArea').innerHTML = '';
 refresh();
+renderTemplateStrip();
 updateSummary();
 updateFixedTotalBadge();
 _renderBmCurrentSummary();
 renderInfoPanel();
 refreshPointsCardUI();
-if (document.getElementById('view-history')?.style.display === 'block') loadMore();
+checkBackupReminder();
+if (document.getElementById('view-history')?.style.display === 'block') {
+if (mode === 'CALENDAR') renderCalendarView(calCurrentYm);
+else loadMore();
+}
 if (document.getElementById('view-analytics')?.style.display === 'block') renderAnalytics();
 }
 
 function updateHeaderAccountName(name) {
-document.getElementById('acct-label').innerText = name;
+const cur = acctInfo.accounts.find(a => a.id === acctInfo.current);
+if (cur && name) cur.name = name;
+renderAcctHeader();
 }
 
 function startAcctRename(id) {
@@ -2928,17 +4308,23 @@ inp.select();
 function commitAcctName(id) {
 const inp  = document.getElementById('acct-name-input-'+id);
 const name = inp.value.trim();
-if (!name) { inp.value = acctInfo.accounts.find(a=>a.id===id)?.name || ''; }
+const target = acctInfo.accounts.find(a => a.id === id);
+if (!name) { inp.value = target?.name || ''; }
 else {
 try {
 DB.setAccountName(id, name);
-// ローカルステートも更新
-const a = acctInfo.accounts.find(a => a.id === id);
-if (a) a.name = name;
+if (target) target.name = name;
 } catch(e) {}
 }
-document.getElementById('acct-name-disp-'+id).innerText = name || acctInfo.accounts.find(a=>a.id===id)?.name;
-document.getElementById('acct-name-disp-'+id).style.display = '';
+const finalName = name || target?.name || '';
+const isBiz = (target?.isBiz === true) || (id === acctInfo.current && isBizMode());
+const pill = isBiz ? '<span class="acct-biz-pill">事業</span>' : '';
+const disp = document.getElementById('acct-name-disp-'+id);
+if (disp) {
+disp.innerHTML = _escHtml(finalName) + pill;
+disp.style.display = '';
+}
+if (id === acctInfo.current) renderAcctHeader();
 inp.style.display = 'none';
 }
 
@@ -2987,6 +4373,15 @@ to:   document.getElementById('an-date-to')?.value   || today
 };
 }
 if (anPreset === 'ALL') return { from: '', to: '' };
+if (anPreset === 'TAX_YEAR') {
+const y = now.getFullYear();
+return { from: `${y}-01-01`, to: `${y}-12-31` };
+}
+if (anPreset === 'SEASON_CUR') {
+const anchor = parseInt(S.periodStartDay) || 25;
+const sp = _calcSeasonPeriod(now, S.seasonType || 'Q', useClosing, anchor, 0);
+return { from: sp.from, to: sp.to };
+}
 
 // ── 締日連動ON：全プリセットを締日期間ベースで計算 ──────────────
 if (useClosing) {
@@ -3226,6 +4621,15 @@ costs.forEach(c => { cardMap[c.id] = c.name; });
 
 const PRESET_NAMES = { MONTH:'当月', PREV_MONTH:'前月', '3M':'3ヶ月', '6M':'半年', '1Y':'1年' };
 const chips = [];
+if (isBizMode()) {
+if (searchFilter.bizKind === 'SALE') chips.push({ label: '売上のみ', type: 'cat' });
+if (searchFilter.bizKind === 'COST') chips.push({ label: '経費のみ', type: 'card' });
+if (searchFilter.settlementStatus === 'UNPAID') chips.push({ label: '未入金のみ', type: 'memo' });
+if (searchFilter.settlementStatus === 'PAID') chips.push({ label: '入金済のみ', type: 'period' });
+} else {
+if (searchFilter.entryType === 'INCOME') chips.push({ label: '収入のみ', type: 'cat' });
+if (searchFilter.entryType === 'EXPENSE') chips.push({ label: '支出のみ', type: 'period' });
+}
 searchFilter.categoryIds.forEach(id => chips.push({ label: catMap[id] || `cat${id}`, type: 'cat' }));
 searchFilter.tagIds.forEach(id       => chips.push({ label: tagMap[id]  || `tag${id}`, type: 'tag' }));
 searchFilter.cardIds.forEach(id      => chips.push({ label: cardMap[id] || `card${id}`, type: 'card' }));
@@ -3244,7 +4648,17 @@ el.innerHTML = chips.map(c =>
 } catch(e) { el.innerHTML = '<span class="active-chip">絞込み中</span>'; }
 }
 
+function setAnEntryType(v) {
+anEntryType = v;
+document.querySelectorAll('#an-entry-type-area .srch-chip').forEach(el => {
+el.classList.toggle('selected', el.dataset.v === v);
+});
+}
+
 function openAnFilter() {
+document.querySelectorAll('#an-entry-type-area .srch-chip').forEach(el => {
+el.classList.toggle('selected', el.dataset.v === anEntryType);
+});
 const cats  = JSON.parse(DB.getMaster('categories')  || '[]');
 const tags  = JSON.parse(DB.getMaster('custom_tags') || '[]');
 document.getElementById('an-cat-area').innerHTML = cats.map(c =>
@@ -3263,7 +4677,11 @@ document.getElementById('an-filter-modal').style.display = 'none';
 }
 
 function resetAnFilter() {
+anEntryType = 'EXPENSE';
 anCatIds = []; anTagIds = []; anMemo = '';
+document.querySelectorAll('#an-entry-type-area .srch-chip').forEach(el => {
+el.classList.toggle('selected', el.dataset.v === 'EXPENSE');
+});
 document.querySelectorAll('#an-cat-area .srch-chip, #an-tag-area .srch-chip')
 .forEach(el => el.classList.remove('selected'));
 const memoEl = document.getElementById('an-memo');
@@ -3297,10 +4715,11 @@ const chipsEl = document.getElementById('an-active-chips');
 const rowEl   = document.getElementById('an-active-chips-row');
 const labelEl = document.getElementById('an-filter-label');
 if (!chipsEl) return;
-const hasFilter = anCatIds.length > 0 || anTagIds.length > 0 || !!anMemo;
+const hasEtFilter = !isBizMode() && anEntryType !== 'EXPENSE';
+const hasFilter = hasEtFilter || anCatIds.length > 0 || anTagIds.length > 0 || !!anMemo;
 if (rowEl) rowEl.style.display = hasFilter ? 'block' : 'none';
 if (!hasFilter) {
-if (labelEl) labelEl.innerText = 'カテゴリ・タグ：全て';
+if (labelEl) labelEl.innerText = '絞込み：全て';
 chipsEl.innerHTML = '';
 return;
 }
@@ -3311,6 +4730,7 @@ const catMap = {}, tagMap = {};
 cats.forEach(c => { catMap[c.id] = c.name; });
 tags.forEach(t => { tagMap[t.id] = t.name; });
 const chips = [];
+if (hasEtFilter) chips.push({ label: anEntryType === 'INCOME' ? '収入のみ' : '収支全て', type: 'cat' });
 anCatIds.forEach(id => chips.push({ label: catMap[id] || `cat${id}`, type: 'cat' }));
 anTagIds.forEach(id => chips.push({ label: tagMap[id] || `tag${id}`, type: 'tag' }));
 if (anMemo) chips.push({ label: `"${anMemo}"`, type: 'memo' });
@@ -3318,6 +4738,7 @@ chipsEl.innerHTML = chips.map(c =>
 `<span class="active-chip active-chip-${c.type}">${_escHtml(c.label)}</span>`
 ).join('');
 const parts = [];
+if (hasEtFilter) parts.push(anEntryType === 'INCOME' ? '収入' : '全種別');
 if (anCatIds.length) parts.push(`カテゴリ${anCatIds.length}件`);
 if (anTagIds.length) parts.push(`タグ${anTagIds.length}件`);
 if (anMemo) parts.push('メモ');
@@ -3332,11 +4753,26 @@ if (!view || view.style.display === 'none') return;
 _updateAnClosingBtn();
 _updateAnFixedBtn();
 _updateAnNoBudgetBtn();
+_updateAnYoYBtn();
 _updateAnPeriodBar();
 if (anTab === 'trend')  renderTrendChart();
 if (anTab === 'cat')    renderCatChart();
 if (anTab === 'pts')    renderPtsChart();
 if (anTab === 'budget') renderBudgetChart();
+}
+
+function toggleAnYoY() {
+vibe();
+anShowYoY = !anShowYoY;
+_updateAnYoYBtn();
+renderAnalytics();
+}
+function _updateAnYoYBtn() {
+const btn = document.getElementById('an-yoy-btn');
+if (!btn) return;
+btn.style.display = (isBizMode() && anTab === 'trend') ? '' : 'none';
+btn.classList.toggle('an-closing-on', anShowYoY);
+btn.querySelector('.an-yoy-label').innerText = anShowYoY ? '📈 前年比較 ON' : '📈 前年比較 OFF';
 }
 
 // 集計期間バー更新
@@ -3352,9 +4788,11 @@ el.innerText = `${fromY}年 ${fmt(range.from)} 〜 ${fmt(range.to)}`;
 }
 
 function destroyChart() {
-// 経費タブのトグルを除去（他タブ遷移時に残らないように）
+// 経費タブ・収支比較のトグルを除去（他タブ遷移時に残らないように）
 const tog = document.getElementById('exp-trend-toggle');
 if (tog) tog.remove();
+const cfTog = document.getElementById('an-cashflow-toggle');
+if (cfTog) cfTog.remove();
 if (anChart) { anChart.destroy(); anChart = null; }
 document.getElementById('an-empty').style.display = 'none';
 document.getElementById('an-canvas').style.display = 'block';
@@ -3393,46 +4831,177 @@ bucket.total += d.total;
 return weeks;
 }
 
+function _renderAnTrendModeToggle() {
+if (isBizMode() || anEntryType === 'INCOME') return;
+const existing = document.getElementById('an-cashflow-toggle');
+if (existing) existing.remove();
+const toggle = document.createElement('div');
+toggle.id = 'an-cashflow-toggle';
+toggle.style.cssText = 'display:flex;gap:6px;margin:0 0 8px;';
+toggle.innerHTML =
+`<button onclick="vibe();switchAnTrendMode('expense')"
+style="flex:1;padding:6px;border-radius:8px;border:1px solid #e2e8f0;font-size:12px;font-weight:700;
+background:${anTrendMode==='expense'?'var(--primary)':'#f8fafc'};
+color:${anTrendMode==='expense'?'#fff':'#64748b'};cursor:pointer;">支出推移</button>
+<button onclick="vibe();switchAnTrendMode('cashflow')"
+style="flex:1;padding:6px;border-radius:8px;border:1px solid #e2e8f0;font-size:12px;font-weight:700;
+background:${anTrendMode==='cashflow'?'#0984e3':'#f8fafc'};
+color:${anTrendMode==='cashflow'?'#fff':'#64748b'};cursor:pointer;">収支比較</button>`;
+const canvas = document.getElementById('an-canvas');
+if (canvas && canvas.parentElement) canvas.parentElement.insertBefore(toggle, canvas);
+}
+
+function switchAnTrendMode(m) {
+anTrendMode = m;
+renderTrendChart();
+}
+
+function openAnalyticsDrilldown(opts) {
+const o = opts || {};
+searchFilter = {
+entryType: o.entryType || (isBizMode() ? 'EXPENSE' : anEntryType),
+bizKind: o.bizKind || 'ALL',
+settlementStatus: o.settlementStatus || 'ALL',
+categoryIds: o.categoryIds ? [...o.categoryIds] : [...anCatIds],
+tagIds: [...anTagIds],
+memo: anMemo || '',
+cardIds: o.cardIds ? [...o.cardIds] : [],
+periodPreset: (o.dateFrom || o.dateTo) ? 'CUSTOM' : 'ALL',
+dateFrom: o.dateFrom || '',
+dateTo: o.dateTo || '',
+useCustom: !!(o.dateFrom || o.dateTo),
+useSort: false,
+sorts: [],
+isDeleteHistory: false
+};
+mode = 'SAVE';
+searchMode = true;
+_skipClearSearchOnce = true;
+doNav('history');
+}
+
+function renderCashflowTrendChart() {
+try {
+destroyChart();
+_renderAnTrendModeToggle();
+const range = getAnDateRange();
+const from = range.from || _getEarliestRecordDate();
+const to = range.to || _todayYmd();
+if (!from || from > to || typeof DB.getMonthlyCashflowStats !== 'function') { showAnEmpty(); _renderAnTrendModeToggle(); return; }
+const rows = JSON.parse(DB.getMonthlyCashflowStats(from, to, JSON.stringify({
+categoryIds: anCatIds, tagIds: anTagIds, memo: anMemo
+})) || '[]');
+if (!rows.length || !rows.some(r => r.expense > 0 || r.income > 0)) {
+showAnEmpty();
+_renderAnTrendModeToggle();
+return;
+}
+const labels = rows.map(r => r.month.slice(5) + '月');
+const incData = rows.map(r => r.income || 0);
+const expData = rows.map(r => r.expense || 0);
+const ctx = document.getElementById('an-canvas').getContext('2d');
+anChart = new Chart(ctx, {
+type: 'bar',
+data: {
+labels,
+datasets: [
+{ label: '収入', data: incData, backgroundColor: '#0984e3', borderRadius: 4 },
+{ label: '支出', data: expData, backgroundColor: '#00b894', borderRadius: 4 }
+]
+},
+options: {
+responsive: true,
+onClick: (_, elements) => {
+if (!elements || !elements.length) return;
+const el = elements[0];
+const row = rows[el.index];
+if (!row) return;
+const y = Number(row.month.slice(0, 4)), m = Number(row.month.slice(5, 7));
+const mFrom = maxDateStr(`${row.month}-01`, from);
+const mTo = minDateStr(`${row.month}-${_pad2(_lastDayOfMonth(y, m))}`, to);
+openAnalyticsDrilldown({
+dateFrom: mFrom,
+dateTo: mTo,
+entryType: el.datasetIndex === 0 ? 'INCOME' : 'EXPENSE'
+});
+},
+plugins: {
+legend: { display: true, labels: { font: { size: 11 }, boxWidth: 14 } },
+tooltip: { callbacks: { label: c => `${c.dataset.label}: ¥${c.parsed.y.toLocaleString()}` } }
+},
+scales: {
+x: { ticks: { font: { size: 10 } } },
+y: { beginAtZero: true, ticks: { callback: v => '¥' + v.toLocaleString() } }
+}
+}
+});
+const totalInc = incData.reduce((s, v) => s + v, 0);
+const totalExp = expData.reduce((s, v) => s + v, 0);
+const netBal = totalInc - totalExp;
+const fmtYen = v => (v < 0 ? '−¥' : '¥') + Math.abs(v).toLocaleString();
+document.getElementById('an-summary-content').innerHTML = `
+<div class="an-scroll-body" id="an-scroll-body">
+<div class="an-summary-grid">
+<div class="an-summary-item"><span class="an-summary-label">総収入</span><span class="an-summary-val" style="color:#0984e3;">${fmtYen(totalInc)}</span></div>
+<div class="an-summary-item"><span class="an-summary-label">総支出</span><span class="an-summary-val">${fmtYen(totalExp)}</span></div>
+<div class="an-summary-item"><span class="an-summary-label">純収支</span><span class="an-summary-val" style="color:${netBal>=0?'#0984e3':'#ef4444'};">${netBal>=0?'+':''}${fmtYen(netBal)}</span></div>
+</div>
+</div>`;
+_fixSummaryScrollHeight();
+} catch(e) { console.error('renderCashflowTrendChart:', e); showAnEmpty(); }
+}
+
+function maxDateStr(a, b) { return (!a || (b && b > a)) ? b : a; }
+function minDateStr(a, b) { return (!a || (b && b < a)) ? b : a; }
+
 // 支出推移（折れ線）
 function renderTrendChart() {
 try {
-destroyChart();
-const range = getAnDateRange();
 const biz = isBizMode();
-const baseFilter = { categoryIds: anCatIds, tagIds: anTagIds, memo: anMemo };
+if (!biz && anEntryType !== 'INCOME' && anTrendMode === 'cashflow') {
+renderCashflowTrendChart();
+return;
+}
+destroyChart();
+_renderAnTrendModeToggle();
+const range = getAnDateRange();
+const effEt = biz ? 'EXPENSE' : anEntryType;
+const baseFilter = { categoryIds: anCatIds, tagIds: anTagIds, memo: anMemo, entryType: effEt };
 const filter = JSON.stringify(biz ? Object.assign({}, baseFilter, { excludeCostTags: true }) : baseFilter);
 const expFilter = JSON.stringify(Object.assign({}, baseFilter, { onlyCostTags: true }));
 
 const gran = _decideTrendGranularity(range.from, range.to);
 let labels, data, unitLabel, rawData = null;
 let rawMonthLabels = [];
+let rawDailyDates = [];
 let _trendGross = 0, _trendExpense = 0;
 
 if (gran === 'daily') {
-if (!range.from || (range.to && range.from > range.to)) { showAnEmpty(); return; }
+if (!range.from || (range.to && range.from > range.to)) { showAnEmpty(); _renderAnTrendModeToggle(); return; }
 const dailyGross = JSON.parse(DB.getDailyStats(range.from, range.to, filter));
-if (!dailyGross || dailyGross.length === 0) { showAnEmpty(); return; }
+if (!dailyGross || dailyGross.length === 0) { showAnEmpty(); _renderAnTrendModeToggle(); return; }
 const dailyExp = biz ? JSON.parse(DB.getDailyStats(range.from, range.to, expFilter)) : [];
+rawDailyDates = dailyGross.map(d => d.date);
 labels = dailyGross.map(d => {
 const parts = d.date.split('-');
 return `${parseInt(parts[2])}日`;
 });
 _trendGross = dailyGross.reduce((s, d) => s + (d.total || 0), 0);
 _trendExpense = biz ? dailyExp.reduce((s, d) => s + (d.total || 0), 0) : 0;
-if (_trendGross === 0 && _trendExpense === 0) { showAnEmpty(); return; }
+if (_trendGross === 0 && _trendExpense === 0) { showAnEmpty(); _renderAnTrendModeToggle(); return; }
 rawData = dailyGross.map((d, i) => (d.total || 0) - (biz ? (dailyExp[i]?.total || 0) : 0));
 let cum = 0;
 data = rawData.map(v => { cum += v; return cum; });
 unitLabel = '日別';
 
 } else if (gran === 'weekly') {
-if (!range.from || (range.to && range.from > range.to)) { showAnEmpty(); return; }
+if (!range.from || (range.to && range.from > range.to)) { showAnEmpty(); _renderAnTrendModeToggle(); return; }
 const dailyGross = JSON.parse(DB.getDailyStats(range.from, range.to, filter));
-if (!dailyGross || dailyGross.length === 0) { showAnEmpty(); return; }
+if (!dailyGross || dailyGross.length === 0) { showAnEmpty(); _renderAnTrendModeToggle(); return; }
 const dailyExp = biz ? JSON.parse(DB.getDailyStats(range.from, range.to, expFilter)) : [];
 _trendGross = dailyGross.reduce((s, d) => s + (d.total || 0), 0);
 _trendExpense = biz ? dailyExp.reduce((s, d) => s + (d.total || 0), 0) : 0;
-if (_trendGross === 0 && _trendExpense === 0) { showAnEmpty(); return; }
+if (_trendGross === 0 && _trendExpense === 0) { showAnEmpty(); _renderAnTrendModeToggle(); return; }
 const weeksGross = _aggregateWeekly(dailyGross);
 const weeksExp = biz ? _aggregateWeekly(dailyExp) : [];
 labels = weeksGross.map(w => w.label + '〜');
@@ -3454,7 +5023,7 @@ if (biz) monthExpRaw = monthExpRaw.filter(m => m.month >= startYm);
 monthGrossRaw = [...monthGrossRaw].reverse();
 if (biz) monthExpRaw = [...monthExpRaw].reverse();
 } else if (range.from) {
-if (range.to && range.from > range.to) { showAnEmpty(); return; }
+if (range.to && range.from > range.to) { showAnEmpty(); _renderAnTrendModeToggle(); return; }
 monthGrossRaw = JSON.parse(DB.getMonthlyStatsByRangeFiltered(range.from, range.to, filter));
 if (biz) monthExpRaw = JSON.parse(DB.getMonthlyStatsByRangeFiltered(range.from, range.to, expFilter));
 } else {
@@ -3463,7 +5032,7 @@ if (biz) monthExpRaw = JSON.parse(DB.getMonthlyStatsFiltered(24, expFilter));
 monthGrossRaw = [...monthGrossRaw].reverse();
 if (biz) monthExpRaw = [...monthExpRaw].reverse();
 }
-if (!monthGrossRaw || monthGrossRaw.length === 0) { showAnEmpty(); return; }
+if (!monthGrossRaw || monthGrossRaw.length === 0) { showAnEmpty(); _renderAnTrendModeToggle(); return; }
 
 const extractMonthVal = m => {
 if (anCatIds.length === 0) return m.total || 0;
@@ -3483,22 +5052,26 @@ _trendGross += g;
 _trendExpense += e;
 return { month: m.month, net: g - e };
 });
-if (_trendGross === 0 && _trendExpense === 0) { showAnEmpty(); return; }
+if (_trendGross === 0 && _trendExpense === 0) { showAnEmpty(); _renderAnTrendModeToggle(); return; }
 labels = filtered.map(m => m.month.slice(5) + '月');
 data = filtered.map(m => m.net);
 unitLabel = '月別';
 }
 
-if (!data || data.length === 0) { showAnEmpty(); return; }
+if (!data || data.length === 0) { showAnEmpty(); _renderAnTrendModeToggle(); return; }
+
+const lineCol = (!biz && effEt === 'INCOME') ? '#0984e3' : '#00b894';
+const lineBg  = (!biz && effEt === 'INCOME') ? 'rgba(9,132,227,0.12)' : 'rgba(0,184,148,0.12)';
+const seriesLbl = biz ? '売上' : (effEt === 'INCOME' ? '収入' : (effEt === 'ALL' ? '金額' : '支出'));
 
 const trendDatasets = (() => {
 const ds = [{
-label: biz ? '売上' : '支出',
+label: seriesLbl,
 data,
-borderColor: '#00b894',
-backgroundColor: 'rgba(0,184,148,0.12)',
+borderColor: lineCol,
+backgroundColor: lineBg,
 borderWidth: 2,
-pointBackgroundColor: '#00b894',
+pointBackgroundColor: lineCol,
 pointRadius: data.length <= 31 ? 4 : data.length <= 60 ? 3 : 2,
 pointHoverRadius: 6,
 tension: 0.3,
@@ -3544,6 +5117,39 @@ fill: false,
 }
 } catch(e) {}
 }
+if (biz && anShowYoY && gran === 'monthly' && rawMonthLabels.length > 0) {
+try {
+const pyFrom = _shiftYearYmd(rawMonthLabels[0] + '-01', -1);
+const lastYm = rawMonthLabels[rawMonthLabels.length - 1];
+const lastY = Number(lastYm.slice(0, 4)) - 1, lastM = Number(lastYm.slice(5, 7));
+const pyTo = `${lastY}-${_pad2(lastM)}-${_pad2(_lastDayOfMonth(lastY, lastM))}`;
+const pyGross = JSON.parse(DB.getMonthlyStatsByRangeFiltered(pyFrom, pyTo, filter) || '[]');
+const pyExp   = JSON.parse(DB.getMonthlyStatsByRangeFiltered(pyFrom, pyTo, expFilter) || '[]');
+const extractMV = m => {
+if (anCatIds.length === 0) return m.total || 0;
+if (m.breakdown) return m.breakdown.filter(b => anCatIds.includes(b.catId)).reduce((s, b) => s + b.amount, 0);
+return m.total || 0;
+};
+const pyGMap = {}, pyEMap = {};
+pyGross.forEach(m => { pyGMap[m.month] = extractMV(m); });
+pyExp.forEach(m => { pyEMap[m.month] = extractMV(m); });
+const yoyData = rawMonthLabels.map(ym => {
+const pyYm = `${Number(ym.slice(0, 4)) - 1}${ym.slice(4)}`;
+return (pyGMap[pyYm] || 0) - (pyEMap[pyYm] || 0);
+});
+ds.push({
+label: '前年',
+data: yoyData,
+borderColor: '#94a3b8',
+backgroundColor: 'transparent',
+borderWidth: 1.8,
+borderDash: [4, 4],
+pointRadius: 2,
+tension: 0.3,
+fill: false,
+});
+} catch(e) {}
+}
 return ds;
 })();
 
@@ -3556,11 +5162,28 @@ datasets: trendDatasets
 },
 options: {
 responsive: true,
+onClick: (_, elements) => {
+if (!elements || !elements.length) return;
+const idx = elements[0].index;
+if (gran === 'monthly' && rawMonthLabels[idx]) {
+const ym = rawMonthLabels[idx];
+const y = Number(ym.slice(0, 4)), m = Number(ym.slice(5, 7));
+openAnalyticsDrilldown({
+dateFrom: maxDateStr(`${ym}-01`, range.from),
+dateTo: minDateStr(`${ym}-${_pad2(_lastDayOfMonth(y, m))}`, range.to),
+entryType: effEt
+});
+} else if (gran === 'daily' && rawDailyDates[idx]) {
+const dStr = rawDailyDates[idx];
+openAnalyticsDrilldown({ dateFrom: dStr, dateTo: dStr, entryType: effEt });
+}
+},
 plugins: {
 legend: { display: biz, labels: { font: { size: 11 }, boxWidth: 20 } },
 tooltip: { callbacks: { label: ctx => {
 const v = (ctx.parsed.y < 0 ? '−¥' : '¥') + Math.abs(ctx.parsed.y).toLocaleString();
 if (ctx.dataset.label === '目標') return '目標 ' + v;
+if (ctx.dataset.label === '前年') return '前年 ' + v;
 const lbl = gran === 'monthly' ? (biz ? '純売上' : '月別') : (biz ? '累計純売上' : '累計');
 return lbl + ' ' + v;
 }}}
@@ -3608,7 +5231,7 @@ return parseInt(S.baseBudget) || 0;
 
 const _trendFrom = range.from || getCurrentPeriod().from;
 const _trendTo   = range.to   || getCurrentPeriod().to;
-const fixedTotal = _anGetFixedTotalForRange(_trendFrom, _trendTo);
+const fixedTotal = (effEt === 'EXPENSE') ? _anGetFixedTotalForRange(_trendFrom, _trendTo) : 0;
 const fixedSub  = (fixedTotal > 0 && anShowFixed && S.fixedOn)
 ? (() => {
 if (biz && S.fixedMode !== 'BUDGET') {
@@ -3626,7 +5249,7 @@ return `<div class="an-summary-item"><span class="an-summary-label">固定費込
 
 const _netSales    = biz ? (_trendGross - _trendExpense) : total;
 const _trendUnder  = biz && _trendBudgetVal > 0 && _netSales < _trendBudgetVal;
-const _totalColor  = _trendUnder ? 'color:#ef4444;font-weight:700;' : '';
+const _totalColor  = _trendUnder ? 'color:#ef4444;font-weight:700;' : (effEt === 'INCOME' ? 'color:#0984e3;' : '');
 const _expRow = (biz && _trendExpense > 0)
 ? `<div class="an-summary-item"><span class="an-summary-label">経費合計</span><span class="an-summary-val" style="color:#e17055;">¥${_trendExpense.toLocaleString()}</span></div>`
 : '';
@@ -3641,10 +5264,11 @@ return `<div class="an-summary-item"><span class="an-summary-label">達成率</s
 })()
 : '';
 const fmtYen = v => (v < 0 ? '−¥' : '¥') + Math.abs(v).toLocaleString();
+const sumHeadLbl = biz ? '総売上' : (effEt === 'INCOME' ? '収入合計' : '期間合計');
 document.getElementById('an-summary-content').innerHTML = `
 <div class="an-scroll-body" id="an-scroll-body">
 <div class="an-summary-grid">
-<div class="an-summary-item"><span class="an-summary-label">${biz ? '総売上' : '期間合計'}</span><span class="an-summary-val" style="${_totalColor}">${fmtYen(biz ? _trendGross : total)}</span></div>
+<div class="an-summary-item"><span class="an-summary-label">${sumHeadLbl}</span><span class="an-summary-val" style="${_totalColor}">${fmtYen(biz ? _trendGross : total)}</span></div>
 ${_expRow}
 ${_targetRow}
 ${_rateRow}
@@ -3661,23 +5285,35 @@ _fixSummaryScrollHeight();
 function renderCatChart() {
 try {
 destroyChart();
+const biz = isBizMode();
+const effEt = biz ? 'EXPENSE' : anEntryType;
 const range  = getAnDateRange();
 const filter = JSON.stringify({
 dateFrom: range.from, dateTo: range.to,
 tagIds: anTagIds, categoryIds: anCatIds, memo: anMemo,
-excludeCostTags: isBizMode()
+entryType: effEt,
+excludeCostTags: biz
 });
 const raw    = JSON.parse(DB.getCategoryStats(filter) || '[]');
 let items = raw.filter(r => r.amount > 0);
 
-const fixedTotal = _anGetFixedTotalForRange(
+const fixedTotal = (effEt === 'EXPENSE') ? _anGetFixedTotalForRange(
 range.from || getCurrentPeriod().from,
 range.to   || getCurrentPeriod().to
-);
+) : 0;
 if (fixedTotal > 0 && anShowFixed && S.fixedOn) {
-items = [...items, { catName: '固定費', amount: fixedTotal, isFixed: true }];
+items = [...items, { catId: 0, catName: '固定費', amount: fixedTotal, isFixed: true }];
 }
 if (items.length === 0) { showAnEmpty(); return; }
+
+const catBudMap = {};
+if (!biz && effEt === 'EXPENSE' && (anPreset === 'MONTH' || anPreset === 'PREV_MONTH') && typeof DB.getCategoryBudgets === 'function') {
+try {
+const budKey = (anPreset === 'MONTH') ? getCurrentPeriod().from : (range.from || getCurrentPeriod().from);
+const cbArr = JSON.parse(DB.getCategoryBudgets(budKey) || '[]');
+cbArr.forEach(c => { if (c.amount > 0) catBudMap[Number(c.categoryId)] = Number(c.amount); });
+} catch(e) {}
+}
 
 const palette = ['#00b894','#0984e3','#fdcb6e','#e17055','#6c5ce7','#a29bfe','#fd79a8','#55efc4','#74b9ff','#fab1a0','#b2bec3'];
 const labels  = items.map(r => r.catName);
@@ -3699,6 +5335,12 @@ borderColor: '#fff',
 },
 options: {
 responsive: true,
+onClick: (_, elements) => {
+if (!elements || !elements.length) return;
+const r = items[elements[0].index];
+if (!r || r.isFixed || !r.catId) return;
+openAnalyticsDrilldown({ categoryIds: [r.catId], dateFrom: range.from, dateTo: range.to, entryType: effEt });
+},
 plugins: {
 legend: { position: 'bottom', labels: { font: { size: 11 }, boxWidth: 12, padding: 8 } },
 tooltip: {
@@ -3717,11 +5359,27 @@ const rows = items.map((r, i) => {
 const pct = ((r.amount / total) * 100).toFixed(1);
 const col = colors[i];
 const fixedMark = r.isFixed ? ' <span style="font-size:10px;color:#94a3b8;">固定</span>' : '';
-return `<div class="an-cat-row">
+const catBud = (!r.isFixed && r.catId) ? (catBudMap[Number(r.catId)] || 0) : 0;
+let budBarHtml = '';
+if (catBud > 0) {
+const bPct = Math.round(r.amount / catBud * 100);
+const rem = catBud - r.amount;
+const fillCls = bPct >= 100 ? ' over' : bPct >= 80 ? ' warn' : '';
+budBarHtml = `<div class="cat-bud-wrap"><div class="cat-bud-fill${fillCls}" style="width:${Math.min(100, bPct)}%;"></div></div>` +
+`<div class="an-cat-sub-bud"><span>予算 ¥${catBud.toLocaleString()} (${bPct}%)</span>` +
+`<span style="color:${rem>=0?'#64748b':'#dc2626'};font-weight:${rem<0?'700':'500'};">${rem>=0?'残 ¥'+rem.toLocaleString():'超過 ▲¥'+Math.abs(rem).toLocaleString()}</span></div>`;
+}
+const clickAttr = (!r.isFixed && r.catId)
+? ` onclick="vibe();openAnalyticsDrilldown({categoryIds:[${r.catId}],dateFrom:'${_escJsAttr(range.from||'')}',dateTo:'${_escJsAttr(range.to||'')}',entryType:'${effEt}'})" style="cursor:pointer;display:block;"`
+: ` style="display:block;"`;
+return `<div class="an-cat-row"${clickAttr}>
+<div style="display:flex;align-items:center;gap:8px;">
 <span class="an-cat-dot" style="background:${col}"></span>
 <span class="an-cat-name">${_escHtml(r.catName)}${fixedMark}</span>
 <span class="an-cat-pct">${pct}%</span>
 <span class="an-cat-amt">¥${r.amount.toLocaleString()}</span>
+</div>
+${budBarHtml}
 </div>`;
 }).join('');
 document.getElementById('an-summary-content').innerHTML =
@@ -3864,6 +5522,14 @@ type: 'line',
 data: { labels: months.map(m => m.label), datasets },
 options: {
 responsive: true,
+onClick: (_, elements) => {
+if (!elements || !elements.length) return;
+const el = elements[0];
+const tag = shownTags[el.datasetIndex];
+const mo = months[el.index];
+if (!tag || !mo) return;
+openAnalyticsDrilldown({ cardIds: [tag.id], dateFrom: mo.from, dateTo: mo.to, bizKind: 'COST' });
+},
 plugins: {
 legend: { position: 'bottom', labels: { font: { size: 11 }, boxWidth: 14 } },
 tooltip: { callbacks: { label: c => c.dataset.label + ': ¥' + c.parsed.y.toLocaleString() } }
@@ -3877,7 +5543,7 @@ y: { ticks: { callback: v => '¥' + v.toLocaleString() }, beginAtZero: true }
 const rows = shownTags.map((tag, i) => {
 const total = datasets[i].data.reduce((s, v) => s + v, 0);
 const pct = grandTotal > 0 ? Math.round(total / grandTotal * 100) : 0;
-return `<div class="an-cat-row">
+return `<div class="an-cat-row" onclick="vibe();openAnalyticsDrilldown({cardIds:[${tag.id}],dateFrom:'${_escJsAttr(range.from||'')}',dateTo:'${_escJsAttr(range.to||'')}',bizKind:'COST'})" style="cursor:pointer;">
 <span class="an-cat-dot" style="background:${palette[i % palette.length]}"></span>
 <span class="an-cat-name">${_escHtml(tag.name)}</span>
 <span class="an-cat-pct">${pct}%</span>
@@ -3949,6 +5615,12 @@ borderWidth: 2,
 },
 options: {
 responsive: true,
+onClick: (_, elements) => {
+if (!elements || !elements.length) return;
+const r = items[elements[0].index];
+if (!r || !r.cardId) return;
+openAnalyticsDrilldown({ cardIds: [r.cardId], dateFrom: range.from, dateTo: range.to, bizKind: 'COST' });
+},
 plugins: {
 legend: { position: 'bottom', labels: { font: { size: 11 }, boxWidth: 14 } },
 tooltip: { callbacks: { label: ctx => ctx.label + ': ¥' + ctx.parsed.toLocaleString() + ' (' + Math.round(ctx.parsed / totalAmt * 100) + '%)' } }
@@ -3959,7 +5631,7 @@ tooltip: { callbacks: { label: ctx => ctx.label + ': ¥' + ctx.parsed.toLocaleSt
 const rows = items.map((r, i) => {
 const pct = totalAmt > 0 ? Math.round(r.amount / totalAmt * 100) : 0;
 const col = colors[i];
-return `<div class="an-cat-row">
+return `<div class="an-cat-row" onclick="vibe();openAnalyticsDrilldown({cardIds:[${r.cardId}],dateFrom:'${_escJsAttr(range.from||'')}',dateTo:'${_escJsAttr(range.to||'')}',bizKind:'COST'})" style="cursor:pointer;">
 <span class="an-cat-dot" style="background:${col}"></span>
 <span class="an-cat-name">${_escHtml(r.name)}</span>
 <span class="an-cat-pct">${pct}%</span>
@@ -4626,7 +6298,14 @@ const spentHeader = _bizMd
 const _needYearHeader = displayMonths.length >= 3;
 
 function _yearHeaderLabel(year, preset) {
-// 将来のシーズンプリセット対応（例: 'SEASON_H1_2024' 等）
+if (preset === 'TAX_YEAR') return `${year}年 確定申告期間 (1〜12月)`;
+if (preset === 'SEASON_CUR') {
+const st = S.seasonType || 'Q';
+if (st === 'CAL_YEAR') return `${year}年 確定申告期間 (1〜12月)`;
+if (st === 'FY') return `${year}年度 (4〜3月)`;
+if (st === 'H') return `${year}年 半期`;
+if (st === 'Q') return `${year}年 四半期`;
+}
 if (typeof preset === 'string') {
 if (preset.includes('Q1')) return year + '年 第1四半期 (1〜3月)';
 if (preset.includes('Q2')) return year + '年 第2四半期 (4〜6月)';
@@ -4763,4 +6442,196 @@ const _t2 =
 
 document.getElementById('an-summary-content').innerHTML = _t1 + _t2;
 _fixSummaryScrollHeight();
+}
+
+// ================================================================
+//  v36: 日付シフト / メモ補完 / 未入金アラート・消込 / 年次確定申告モーダル
+// ================================================================
+function _shiftYearYmd(ymd, deltaYears) {
+if (!ymd || ymd.length < 10) return ymd;
+const ny = parseInt(ymd.slice(0, 4), 10) + deltaYears;
+const m = parseInt(ymd.slice(5, 7), 10);
+const d = Math.min(parseInt(ymd.slice(8, 10), 10), _lastDayOfMonth(ny, m));
+return `${ny}-${_pad2(m)}-${_pad2(d)}`;
+}
+
+function onMemoInputFocus() {
+if (isBizMode()) _renderMemoSuggestions(document.getElementById('itemName')?.value || '');
+}
+function onMemoInputChange() {
+if (!isBizMode()) return;
+if (_memoSuggestTimer) clearTimeout(_memoSuggestTimer);
+_memoSuggestTimer = setTimeout(() => {
+_renderMemoSuggestions(document.getElementById('itemName')?.value || '');
+}, 120);
+}
+function _renderMemoSuggestions(prefix) {
+const row = document.getElementById('memo-suggest-row');
+if (!row || typeof DB === 'undefined' || typeof DB.getMemoSuggestions !== 'function' || !isBizMode()) {
+if (row) row.style.display = 'none';
+return;
+}
+try {
+const arr = JSON.parse(DB.getMemoSuggestions(String(prefix || ''), 8) || '[]');
+if (!arr.length) {
+row.style.display = 'none';
+row.innerHTML = '';
+return;
+}
+row.innerHTML = arr.map(s =>
+`<button type="button" class="memo-suggest-chip" onclick="vibe();selectMemoSuggestion('${_escJsAttr(s.name)}')">${_escHtml(s.name)}</button>`
+).join('');
+row.style.display = 'flex';
+} catch(e) {
+row.style.display = 'none';
+}
+}
+function selectMemoSuggestion(name) {
+const inp = document.getElementById('itemName');
+if (inp) inp.value = name;
+const row = document.getElementById('memo-suggest-row');
+if (row) row.style.display = 'none';
+}
+
+function _refreshUnpaidAlerts() {
+const stripIn = document.getElementById('unpaid-alert-strip');
+const stripHi = document.getElementById('hist-unpaid-banner');
+if (!isBizMode() || typeof DB === 'undefined' || typeof DB.getUnpaidSummary !== 'function') {
+if (stripIn) stripIn.style.display = 'none';
+if (stripHi) stripHi.style.display = 'none';
+return;
+}
+try {
+const u = JSON.parse(DB.getUnpaidSummary() || '{}');
+const cnt = Number(u.count || 0);
+if (cnt <= 0) {
+if (stripIn) stripIn.style.display = 'none';
+if (stripHi) stripHi.style.display = 'none';
+return;
+}
+const overCnt = Number(u.overdueCount || 0);
+const overTxt = overCnt > 0 ? `（期限超過 ${overCnt}件）` : '';
+const msgHtml =
+`<span>${overCnt > 0 ? '⚠️' : '💰'} 未入金/未払 ${cnt}件 合計 ¥${Number(u.totalAmount||0).toLocaleString()}${overTxt}</span>` +
+`<span style="white-space:nowrap;">確認 ▶</span>`;
+[stripIn, stripHi].forEach(el => {
+if (!el) return;
+el.innerHTML = msgHtml;
+el.classList.toggle('overdue', overCnt > 0);
+el.style.display = 'flex';
+});
+} catch(e) {
+if (stripIn) stripIn.style.display = 'none';
+if (stripHi) stripHi.style.display = 'none';
+}
+}
+
+function openUnpaidFilter() {
+searchFilter = {
+entryType: 'ALL',
+bizKind: 'ALL',
+settlementStatus: 'UNPAID',
+categoryIds: [],
+tagIds: [],
+memo: '',
+cardIds: [],
+periodPreset: 'ALL',
+dateFrom: '',
+dateTo: '',
+useCustom: false,
+useSort: false,
+sorts: [],
+isDeleteHistory: false
+};
+mode = 'SAVE';
+searchMode = true;
+_skipClearSearchOnce = true;
+doNav('history');
+}
+
+function quickSettleRecord(id, evt) {
+if (evt && typeof evt.stopPropagation === 'function') evt.stopPropagation();
+if (typeof DB === 'undefined' || typeof DB.markAsSettled !== 'function') return;
+DB.markAsSettled(id);
+_refreshUnpaidAlerts();
+updateSummary();
+renderInfoPanel();
+if (document.getElementById('view-history')?.style.display === 'block') {
+if (mode === 'CALENDAR') renderCalendarView(calCurrentYm);
+else {
+currentOffset = 0;
+document.getElementById('displayArea').innerHTML = '';
+loadMore();
+_renderSearchSummaryBar();
+}
+}
+showToast('入金済に更新しました');
+}
+
+function openAnnualTaxReportModal(year) {
+if (typeof DB === 'undefined' || typeof DB.getAnnualTaxReport !== 'function') return;
+const y = year || new Date().getFullYear();
+let r = {};
+try { r = JSON.parse(DB.getAnnualTaxReport(y) || '{}'); } catch(e) {}
+const gross = Number(r.grossSales || 0);
+const paid = Number(r.paidSales || 0);
+const unpaid = Number(r.unpaidSales || 0);
+const cost = Number(r.costTotal || 0);
+const fixed = S.fixedOn ? Number(r.fixedTotal || 0) : 0;
+const netIncome = gross - cost - fixed;
+const ts = r.taxSummary || {};
+const cb = Array.isArray(r.costBreakdown) ? r.costBreakdown : [];
+
+const cbHtml = cb.length === 0
+? '<div style="font-size:12px;color:#94a3b8;padding:6px 0;">経費記録なし</div>'
+: cb.map(x => `<div class="tax-report-row"><span>${_escHtml(x.tagName)} (${x.count}件)</span><b>¥${Number(x.amount||0).toLocaleString()}</b></div>`).join('');
+
+const body =
+`<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">` +
+`<button type="button" onclick="vibe();openAnnualTaxReportModal(${y - 1})" style="padding:5px 12px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;font-weight:700;">◀</button>` +
+`<span style="font-size:15px;font-weight:700;">${y}年分（1/1〜12/31）</span>` +
+`<button type="button" onclick="vibe();openAnnualTaxReportModal(${y + 1})" style="padding:5px 12px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;font-weight:700;">▶</button>` +
+`</div>` +
+`<div style="max-height:360px;overflow-y:auto;">` +
+`<div class="tax-report-card">` +
+`<div style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:4px;">損益サマリー</div>` +
+`<div class="tax-report-row"><span>総売上（発生ベース）</span><b style="color:#0984e3;">¥${gross.toLocaleString()}</b></div>` +
+`<div class="tax-report-row"><span>└ うち入金済 / 売掛残</span><span>¥${paid.toLocaleString()} / <b style="color:${unpaid>0?'#d97706':'#64748b'};">¥${unpaid.toLocaleString()}</b></span></div>` +
+`<div class="tax-report-row"><span>必要経費合計</span><b style="color:#e17055;">−¥${cost.toLocaleString()}</b></div>` +
+(S.fixedOn ? `<div class="tax-report-row"><span>年間固定費</span><b style="color:#64748b;">−¥${fixed.toLocaleString()}</b></div>` : '') +
+`<div class="tax-report-row" style="padding-top:6px;"><span><b>差引所得（粗利）</b></span><b style="font-size:15px;color:${netIncome>=0?'#00b894':'#dc2626'};">${netIncome<0?'−':''}¥${Math.abs(netIncome).toLocaleString()}</b></div>` +
+`</div>` +
+`<div class="tax-report-card">` +
+`<div style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:4px;">税区分・インボイス集計</div>` +
+`<div class="tax-report-row"><span>売上 10% / 8% / 対象外</span><span>¥${Number(ts.sales10||0).toLocaleString()} / ¥${Number(ts.sales8||0).toLocaleString()} / ¥${Number(ts.sales0||0).toLocaleString()}</span></div>` +
+`<div class="tax-report-row"><span>経費 10% / 8% / 対象外</span><span>¥${Number(ts.cost10||0).toLocaleString()} / ¥${Number(ts.cost8||0).toLocaleString()} / ¥${Number(ts.cost0||0).toLocaleString()}</span></div>` +
+`<div class="tax-report-row"><span>経費 適格請求書 / 非適格</span><span>¥${Number(ts.invoiceCostTotal||0).toLocaleString()} / ¥${Number(ts.nonInvoiceCostTotal||0).toLocaleString()}</span></div>` +
+`</div>` +
+`<div class="tax-report-card">` +
+`<div style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:4px;">経費科目別内訳</div>${cbHtml}` +
+`</div>` +
+`<button type="button" onclick="vibe();exportAnnualTaxCsv(${y})" style="width:100%;padding:10px;border:none;border-radius:10px;background:#0984e3;color:#fff;font-size:13px;font-weight:700;cursor:pointer;">📊 ${y}年 確定申告CSVを出力</button>` +
+`</div>`;
+
+showModal('年次損益・確定申告サマリー', body, false);
+}
+
+function exportAnnualTaxCsv(year) {
+if (typeof DB === 'undefined' || typeof DB.exportCsvToFile !== 'function') return;
+try {
+const path = DB.exportCsvToFile(JSON.stringify({
+periodPreset: 'CUSTOM',
+dateFrom: `${year}-01-01`,
+dateTo: `${year}-12-31`,
+entryType: 'ALL',
+bizMode: true
+}));
+if (path.startsWith('ERROR')) {
+showModal('エラー', 'CSV出力に失敗しました。<br>' + _escHtml(path), false);
+} else {
+showModal('完了', `${year}年の確定申告CSVを保存しました。<br><br><span style="font-size:11px;word-break:break-all;color:var(--text-sub);">${_escHtml(path)}</span>`, false);
+}
+} catch(e) {
+showModal('エラー', 'CSV出力に失敗しました。<br>' + _escHtml(e.message), false);
+}
 }

@@ -19,6 +19,32 @@
 </div>
 <div class="srch-body">
 
+<!-- 種別 -->
+<div class="srch-section" id="srch-entry-type-sec">
+<div class="srch-label">種別</div>
+<div class="srch-chip-area" id="srch-entry-type-area">
+<div class="srch-chip selected" data-v="ALL" onclick="vibe();setSrchEntryType('ALL',this)">全て</div>
+<div class="srch-chip" data-v="EXPENSE" onclick="vibe();setSrchEntryType('EXPENSE',this)">支出のみ</div>
+<div class="srch-chip" data-v="INCOME" onclick="vibe();setSrchEntryType('INCOME',this)">収入のみ</div>
+</div>
+</div>
+
+<!-- 売上・経費・入金状態（売上管理モード時） -->
+<div class="srch-section" id="srch-biz-kind-sec" style="display:none;">
+<div class="srch-label">売上・経費種別</div>
+<div class="srch-chip-area" id="srch-biz-kind-area">
+<div class="srch-chip selected" data-v="ALL" onclick="vibe();setSrchBizKind('ALL')">全て</div>
+<div class="srch-chip" data-v="SALE" onclick="vibe();setSrchBizKind('SALE')">売上のみ</div>
+<div class="srch-chip" data-v="COST" onclick="vibe();setSrchBizKind('COST')">経費のみ</div>
+</div>
+<div class="srch-label" style="margin-top:8px;">入金状態</div>
+<div class="srch-chip-area" id="srch-settlement-area">
+<div class="srch-chip selected" data-v="ALL" onclick="vibe();setSrchSettlement('ALL')">全て</div>
+<div class="srch-chip" data-v="PAID" onclick="vibe();setSrchSettlement('PAID')">入金済</div>
+<div class="srch-chip" data-v="UNPAID" onclick="vibe();setSrchSettlement('UNPAID')">未入金（売掛）</div>
+</div>
+</div>
+
 <!-- カテゴリ -->
 <div class="srch-section">
 <div class="srch-label">カテゴリ <span class="srch-hint">（複数選択可）</span></div>
@@ -119,11 +145,49 @@
 <!-- ===== 入力タブ ===== -->
 <div id="view-input" class="container">
 
+<div id="unpaid-alert-strip" class="unpaid-strip" style="display:none;" onclick="vibe();openUnpaidFilter()"></div>
+
+<div id="input-entry-type-tabs" class="entry-type-tabs">
+<button id="et-btn-expense" class="entry-type-btn active" onclick="vibe();setInputEntryType('EXPENSE')">支出</button>
+<button id="et-btn-income" class="entry-type-btn" onclick="vibe();setInputEntryType('INCOME')">収入</button>
+</div>
+
+<div id="tpl-strip-wrap" class="tpl-strip-wrap">
+<div id="tpl-chip-list" class="tpl-chip-list"></div>
+<button class="tpl-add-btn" id="tpl-save-btn" onclick="vibe();saveCurrentAsTemplate()">＋定型</button>
+<button class="tpl-manage-btn" onclick="vibe();openTemplateManagerModal()" title="定型入力を管理">⚙️</button>
+</div>
+
 <div class="section-card">
-<div class="input-label">金額 <span class="edit-link" id="card-edit-link" onclick="vibe();openCardOrExpenseEdit()">カード編集</span></div>
+<div class="input-label"><span>金額</span><span style="display:flex;gap:6px;align-items:center;"><button class="calc-toggle-btn" id="calc-toggle-btn" onclick="vibe();toggleCalcBar()">電卓</button><span class="edit-link" id="card-edit-link" onclick="vibe();openCardOrExpenseEdit()">カード編集</span></span></div>
 <div class="amt-wrapper">
 <input type="number" id="amount" placeholder="¥ 0">
 <button id="cardBtn" class="card-toggle" onclick="vibe();toggleCardUse()">CARD</button>
+</div>
+<div id="calc-bar" class="calc-bar" style="display:none;">
+<div id="calc-expr" class="calc-expr">0</div>
+<div class="calc-grid">
+<button class="calc-key fn" onclick="vibe();calcClear()">C</button>
+<button class="calc-key fn" onclick="vibe();calcBackspace()">⌫</button>
+<button class="calc-key tax" onclick="vibe();calcApplyTax(8)">+8%</button>
+<button class="calc-key op" onclick="vibe();calcPress('/')">÷</button>
+<button class="calc-key" onclick="vibe();calcPress('7')">7</button>
+<button class="calc-key" onclick="vibe();calcPress('8')">8</button>
+<button class="calc-key" onclick="vibe();calcPress('9')">9</button>
+<button class="calc-key op" onclick="vibe();calcPress('*')">×</button>
+<button class="calc-key" onclick="vibe();calcPress('4')">4</button>
+<button class="calc-key" onclick="vibe();calcPress('5')">5</button>
+<button class="calc-key" onclick="vibe();calcPress('6')">6</button>
+<button class="calc-key op" onclick="vibe();calcPress('-')">−</button>
+<button class="calc-key" onclick="vibe();calcPress('1')">1</button>
+<button class="calc-key" onclick="vibe();calcPress('2')">2</button>
+<button class="calc-key" onclick="vibe();calcPress('3')">3</button>
+<button class="calc-key op" onclick="vibe();calcPress('+')">＋</button>
+<button class="calc-key" onclick="vibe();calcPress('0')">0</button>
+<button class="calc-key" onclick="vibe();calcPress('00')">00</button>
+<button class="calc-key tax" onclick="vibe();calcApplyTax(10)">+10%</button>
+<button class="calc-key eq" onclick="vibe();calcEvaluate()">＝</button>
+</div>
 </div>
 <div id="pointSection" style="display:none; margin-top:8px;">
 <div class="input-label" id="card-area-label" style="margin-bottom:4px;">使用カード</div>
@@ -143,9 +207,31 @@
 <button class="memo-toggle-btn" id="memoToggleBtn" onclick="vibe();toggleMemo()">メモ ＋</button>
 </div>
 <div id="memoArea" style="display:none; margin-top:8px;">
-<input type="text" id="itemName" placeholder="メモを入力">
+<input type="text" id="itemName" placeholder="メモを入力" oninput="onMemoInputChange()" onfocus="onMemoInputFocus()">
+<div id="memo-suggest-row" class="memo-suggest-chips" style="display:none;"></div>
 </div>
 <div id="tagArea" class="tag-container" style="margin-top:6px;"></div>
+</div>
+
+<!-- ===== 売上管理モード専用：税区分・インボイス・入金状態バー ===== -->
+<div id="biz-meta-bar" class="section-card biz-meta-bar" style="display:none;">
+<div class="biz-meta-row">
+<span class="biz-meta-lbl">税区分</span>
+<div class="biz-chip-group">
+<button type="button" class="biz-chip selected" data-tax="0" onclick="vibe();setBizTaxRate(0)">対象外</button>
+<button type="button" class="biz-chip" data-tax="10" onclick="vibe();setBizTaxRate(10)">10%</button>
+<button type="button" class="biz-chip" data-tax="8" onclick="vibe();setBizTaxRate(8)">8%</button>
+<button type="button" class="biz-chip biz-inv-chip" id="biz-invoice-chip" onclick="vibe();toggleBizInvoiceFlag()">適格</button>
+</div>
+</div>
+<div class="biz-meta-row" style="margin-top:6px;">
+<span class="biz-meta-lbl">入金</span>
+<div class="biz-chip-group">
+<button type="button" class="biz-chip selected" data-ss="PAID" onclick="vibe();setBizSettlementStatus('PAID')">入金済</button>
+<button type="button" class="biz-chip" data-ss="UNPAID" onclick="vibe();setBizSettlementStatus('UNPAID')">未入金(売掛)</button>
+<input type="date" id="biz-due-date" class="biz-due-input" style="display:none;" onchange="onBizDueDateChange()" title="入金予定日">
+</div>
+</div>
 </div>
 
 <!-- ===== 入力タブ インフォパネル（ランキング・比較・ポイント） ===== -->
@@ -193,6 +279,11 @@
 <span class="summary-fixed-label">うち固定費</span>
 <span class="summary-fixed-val" id="summary-fixed-val">¥ 0</span>
 </div>
+<!-- 収支バランスサブ表示 -->
+<div class="summary-cashflow-sub" id="summary-cashflow-sub" style="display:none;">
+<span id="summary-cf-inc">収入 ¥0</span>
+<span id="summary-cf-bal">収支 ¥0</span>
+</div>
 </div>
 <div class="fab-col">
 <div class="date-chip" id="dateChip" onclick="vibe();openDatePicker()">
@@ -208,15 +299,38 @@
 <div id="view-history" class="container" style="display:none;">
 <div class="hist-tabs">
 <div class="history-tab active" id="tab-save" onclick="vibe();subTab('SAVE')">保存履歴</div>
+<div class="history-tab" id="tab-calendar" onclick="vibe();subTab('CALENDAR')">📅 カレンダー</div>
 <div class="history-tab" id="tab-delete" onclick="vibe();subTab('DELETE')">削除履歴</div>
 <div class="history-tab srch-tab-btn" id="tab-search" onclick="vibe();openSearch()">🔍 絞込</div>
 </div>
+<div id="hist-unpaid-banner" class="unpaid-strip" style="display:none;" onclick="vibe();openUnpaidFilter()"></div>
 <!-- 検索中バナー -->
 <div id="srch-active-bar" style="display:none;" class="srch-active-bar">
 <div class="srch-active-inner">
 <div id="srch-active-chips" class="srch-active-chips"></div>
 <button onclick="vibe();clearSearch()" class="srch-clear-btn">クリア ✕</button>
 </div>
+</div>
+<!-- 検索集計サマリーバー -->
+<div id="srch-summary-bar" class="srch-summary-bar" style="display:none;"></div>
+<!-- カレンダー表示 -->
+<div id="cal-view-wrap" style="display:none;">
+<div class="section-card" style="padding:10px;">
+<div class="cal-header">
+<button class="cal-nav-btn" onclick="vibe();moveCalendarMonth(-1)">◀</button>
+<div class="cal-title-wrap">
+<span id="cal-month-label" class="cal-month-label">----年-月</span>
+<span id="cal-nmd-badge" class="cal-nmd-badge" style="display:none;"></span>
+</div>
+<button class="cal-nav-btn" onclick="vibe();moveCalendarMonth(1)">▶</button>
+</div>
+<div id="cal-month-totals" class="cal-month-totals"></div>
+<div class="cal-weekdays">
+<span class="sun">日</span><span>月</span><span>火</span><span>水</span><span>木</span><span>金</span><span class="sat">土</span>
+</div>
+<div id="cal-grid" class="cal-grid"></div>
+</div>
+<div id="cal-day-records" class="cal-day-records"></div>
 </div>
 <div id="displayArea"></div>
 <button id="loadMoreBtn" class="more-btn" onclick="vibe();loadMore()">続きを表示</button>
@@ -243,13 +357,6 @@
 <div class="section-card">
 <div class="s-num-label"><span class="s-num">2</span>期間・内容設定</div>
 <div class="setting-row">
-<span>表示形式</span>
-<select id="set-biz-mode" onchange="vibe();onBizModeChange()">
-<option value="false">支出管理</option>
-<option value="true">売上管理</option>
-</select>
-</div>
-<div class="setting-row">
 <span>表示期間</span>
 <select id="set-period-unit" onchange="vibe();onSettingSelectChange('set-period-unit')">
 <option value="WEEK">今週</option>
@@ -258,22 +365,48 @@
 <option value="SEASON">シーズン</option>
 </select>
 </div>
-<div id="row-season-preset" class="setting-row" style="display:none;">
-<span>シーズン定義</span>
-<select id="set-season-type" onchange="vibe();onSettingSelectChange(this.id)">
-<option value="Q">四半期</option>
-<option value="H">半期（上半期／下半期）</option>
-<option value="FY">年度（4月〜翌3月）</option>
-</select>
-</div>
 <div class="setting-row">
 <span>表示内容</span>
 <select id="set-simple-view" onchange="vibe();onSettingSelectChange(this.id)">
 <option value="EXP" selected>支出額のみ</option>
 <option value="REMAIN">残予算のみ</option>
 <option value="BOTH">支出額 &amp; 残予算</option>
+<option value="CASHFLOW">収支バランスも表示</option>
 </select>
 </div>
+<details id="settings-adv-biz" class="adv-biz-details">
+<summary class="adv-biz-summary">
+<span>💼 上級者・個人事業主向け設定</span>
+<span class="adv-biz-badge" id="adv-biz-state-badge">通常モード</span>
+</summary>
+<div class="adv-biz-body">
+<div class="setting-row">
+<span>表示形式</span>
+<select id="set-biz-mode" onchange="vibe();onBizModeChange()">
+<option value="false">支出管理（一般家計簿）</option>
+<option value="true">売上管理（個人事業主）</option>
+</select>
+</div>
+<div id="row-season-preset" class="setting-row" style="display:none;">
+<span>シーズン定義</span>
+<select id="set-season-type" onchange="vibe();onSettingSelectChange(this.id)">
+<option value="Q">四半期</option>
+<option value="H">半期（上半期／下半期）</option>
+<option value="FY">年度（4月〜翌3月）</option>
+<option value="CAL_YEAR">確定申告暦年（1/1〜12/31）</option>
+</select>
+</div>
+<div id="row-biz-default-tax" class="setting-row" style="display:none;">
+<span>標準税率デフォルト</span>
+<select id="set-default-tax" onchange="vibe();onSettingSelectChange(this.id)">
+<option value="0">対象外（非課税・未指定）</option>
+<option value="10">10%（標準税率）</option>
+<option value="8">8%（軽減税率）</option>
+</select>
+</div>
+<button id="btn-annual-tax-report" class="sub-btn" style="display:none;margin-top:8px;" onclick="vibe();openAnnualTaxReportModal()">📄 年次損益・確定申告サマリー</button>
+</div>
+</details>
 <div class="s-hr"></div>
 <div class="setting-row">
 <span id="toggle-points-label">獲得ポイントを表示</span>
@@ -437,9 +570,12 @@ class="day-input" onchange="onSettingSelectChange(this.id)">
 
 <div class="section-card">
 <div class="s-num-label"><span class="s-num">8</span>データ管理</div>
+<div id="backup-reminder-banner" class="backup-reminder-banner" style="display:none;"></div>
 <div class="s-sub-label">バックアップ・書き出し</div>
 <button class="sub-btn" onclick="vibe();doExport()">📤 JSONファイルにエクスポート</button>
-<div style="font-size:11px;color:var(--text-sub);margin:4px 0 12px 2px;">端末の「外部ストレージ / kakeibo_backup_*.json」に保存</div>
+<div style="font-size:11px;color:var(--text-sub);margin:4px 0 10px 2px;">端末の「Downloads / KakeiboBackup / アカウント名 / kakeibo_*.json」に保存</div>
+<button class="sub-btn" onclick="vibe();doExportCsv(false)">📊 CSVファイルにエクスポート（表計算向け）</button>
+<div style="font-size:11px;color:var(--text-sub);margin:4px 0 12px 2px;">Excel・Googleスプレッドシート対応（BOM付きUTF-8）</div>
 <div class="s-sub-label">復元・読み込み</div>
 <button class="sub-btn" onclick="vibe();openImportModal()">📥 JSONファイルからインポート</button>
 <div style="font-size:11px;color:var(--text-sub);margin:4px 0 4px 2px;">インポート前に自動バックアップを作成します</div>
@@ -457,6 +593,8 @@ class="day-input" onchange="onSettingSelectChange(this.id)">
 <div class="analytics-period-row" id="an-preset-row" style="flex:1;min-width:0;">
 <div class="an-period-chip selected" data-v="MONTH"  onclick="vibe();setAnPreset('MONTH')">当月</div>
 <div class="an-period-chip" data-v="PREV_MONTH"      onclick="vibe();setAnPreset('PREV_MONTH')">前月</div>
+<div class="an-period-chip" data-v="SEASON_CUR" id="an-chip-season" style="display:none;" onclick="vibe();setAnPreset('SEASON_CUR')">今期</div>
+<div class="an-period-chip" data-v="TAX_YEAR"   id="an-chip-taxyear" style="display:none;" onclick="vibe();setAnPreset('TAX_YEAR')">今年(申告)</div>
 <div class="an-period-chip" data-v="3M"              onclick="vibe();setAnPreset('3M')">3ヶ月</div>
 <div class="an-period-chip" data-v="6M"              onclick="vibe();setAnPreset('6M')">半年</div>
 <div class="an-period-chip" data-v="1Y"              onclick="vibe();setAnPreset('1Y')">1年</div>
@@ -489,6 +627,12 @@ style="flex-shrink:0;background:none;border:1px solid #e2e8f0;border-radius:8px;
 </button>
 <button id="an-nobudget-btn" class="an-closing-btn" onclick="toggleAnNoBudget()" style="display:none;font-size:11px;padding:4px 8px;">
 <span class="an-nobudget-label">⛔ 未設定除外 OFF</span>
+</button>
+<button id="an-yoy-btn" class="an-closing-btn" onclick="toggleAnYoY()" style="display:none;font-size:11px;padding:4px 8px;">
+<span class="an-yoy-label">📈 前年比較 OFF</span>
+</button>
+<button id="an-tax-report-btn" class="an-closing-btn" onclick="vibe();openAnnualTaxReportModal()" style="display:none;font-size:11px;padding:4px 8px;">
+<span>📄 確定申告</span>
 </button>
 </div>
 <!-- 集計期間・フィルターチップ -->
@@ -532,6 +676,14 @@ style="background:#f8fafc;border:none;border-left:1px solid #e2e8f0;padding:0 10
 <button class="srch-close" onclick="vibe();closeAnFilter()">✕</button>
 </div>
 <div class="srch-body">
+<div class="srch-section" id="an-entry-type-sec">
+<div class="srch-label">種別</div>
+<div class="srch-chip-area" id="an-entry-type-area">
+<div class="srch-chip selected" data-v="EXPENSE" onclick="vibe();setAnEntryType('EXPENSE',this)">支出</div>
+<div class="srch-chip" data-v="INCOME" onclick="vibe();setAnEntryType('INCOME',this)">収入</div>
+<div class="srch-chip" data-v="ALL" onclick="vibe();setAnEntryType('ALL',this)">全て</div>
+</div>
+</div>
 <div class="srch-section">
 <div class="srch-label">メモ検索</div>
 <input type="text" id="an-memo" class="srch-memo-input" placeholder="メモのキーワード">
@@ -551,6 +703,8 @@ style="background:#f8fafc;border:none;border-left:1px solid #e2e8f0;padding:0 10
 </div>
 </div>
 </div>
+
+<div id="app-toast" class="app-toast" style="display:none;"></div>
 
 <button id="actionFab" onclick="vibe();batchAction()">一括操作</button>
 <div class="tab-bar">

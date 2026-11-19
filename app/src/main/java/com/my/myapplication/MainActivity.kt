@@ -3,12 +3,21 @@ package com.my.myapplication
 import android.app.Activity
 import android.content.Intent
 import android.content.SharedPreferences
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.webkit.*
+import android.widget.FrameLayout
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
 private lateinit var webView: WebView
@@ -17,6 +26,7 @@ private lateinit var prefs: SharedPreferences
 
 // E2: インポート確認用に読み込んだJSONを一時保持
 private var pendingImportJson: String? = null
+private var lastActiveDate: String = ""
 
 companion object {
 private const val REQ_PICK_JSON  = 1001
@@ -26,20 +36,25 @@ private const val KEY_ACCT_NAME  = "account_name_"
 private val DEFAULT_NAMES = arrayOf("アカウント1", "アカウント2", "アカウント3")
 }
 
-private var currentAccount: Int = 1
+private fun todayYmd(): String =
+SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
 
 /** 現在のアカウント名を返す */
 private fun currentAccountName(): String =
 prefs.getString("$KEY_ACCT_NAME$currentAccount", DEFAULT_NAMES[currentAccount - 1])
 ?: DEFAULT_NAMES[currentAccount - 1]
 
+private var currentAccount: Int = 1
+
 override fun onCreate(savedInstanceState: Bundle?) {
 super.onCreate(savedInstanceState)
 supportActionBar?.hide()
+WindowCompat.setDecorFitsSystemWindows(window, false)
 
 prefs = getSharedPreferences(PREF_NAME, MODE_PRIVATE)
 currentAccount = prefs.getInt(KEY_CUR_ACCT, 1)
 dbHelper = DatabaseHelper(this, if (currentAccount == 1) "KakeiboDB" else "KakeiboDB_$currentAccount")
+lastActiveDate = todayYmd()
 
 webView = WebView(this).apply {
 settings.javaScriptEnabled = true
@@ -48,7 +63,46 @@ webChromeClient = WebChromeClient()
 addJavascriptInterface(WebAppInterface(), "DB")
 loadUrl("file:///android_asset/index.html")
 }
-setContentView(webView)
+
+val container = FrameLayout(this).apply {
+setBackgroundColor(Color.parseColor("#2d3436"))
+addView(
+webView,
+FrameLayout.LayoutParams(
+FrameLayout.LayoutParams.MATCH_PARENT,
+FrameLayout.LayoutParams.MATCH_PARENT
+)
+)
+}
+setContentView(container)
+
+WindowCompat.getInsetsController(window, container).apply {
+isAppearanceLightStatusBars = false
+isAppearanceLightNavigationBars = true
+}
+
+ViewCompat.setOnApplyWindowInsetsListener(container) { v, insets ->
+val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
+v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+insets
+}
+
+onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+override fun handleOnBackPressed() {
+webView.evaluateJavascript("handleBack()", null)
+}
+})
+}
+
+override fun onResume() {
+super.onResume()
+val cur = todayYmd()
+if (lastActiveDate.isNotEmpty() && cur != lastActiveDate) {
+lastActiveDate = cur
+webView.post {
+webView.evaluateJavascript("if(typeof onAppDateChanged==='function')onAppDateChanged();", null)
+}
+}
 }
 
 // ファイルピッカー結果 → E2: まずメタ情報をJSに渡して確認
@@ -67,16 +121,33 @@ val json = contentResolver.openInputStream(uri)?.bufferedReader()?.readText()
 val root        = JSONObject(json)
 val fileAcct    = root.optString("account_name", "不明")
 val exportedAt  = root.optString("exported_at",  "不明")
-val recordCount = root.optInt("record_count", root.optJSONArray("expenses")?.length() ?: 0)
+val expensesArr = root.optJSONArray("expenses")
+val recordCount = root.optInt("record_count", expensesArr?.length() ?: 0)
 val curAcctName = currentAccountName()
+
+var minDate = ""
+var maxDate = ""
+if (expensesArr != null) {
+for (i in 0 until expensesArr.length()) {
+val d = expensesArr.optJSONObject(i)?.optString("date", "") ?: ""
+if (d.length >= 10 && d != "null") {
+if (minDate.isEmpty() || d < minDate) minDate = d
+if (maxDate.isEmpty() || d > maxDate) maxDate = d
+}
+}
+}
 
 pendingImportJson = json  // 確認後に使用
 
 val meta = JSONObject().apply {
-put("fileAccount",    fileAcct)
-put("exportedAt",     exportedAt)
-put("recordCount",    recordCount)
-put("currentAccount", curAcctName)
+put("fileAccount",        fileAcct)
+put("exportedAt",         exportedAt)
+put("recordCount",        recordCount)
+put("currentAccount",     curAcctName)
+put("minDate",            minDate)
+put("maxDate",            maxDate)
+put("hasTemplates",       (root.optJSONArray("input_templates")?.length() ?: 0) > 0)
+put("hasCategoryBudgets", (root.optJSONArray("category_budgets")?.length() ?: 0) > 0)
 }
 val quoted = JSONObject.quote(meta.toString())
 webView.post { webView.evaluateJavascript("onImportFileReady($quoted)", null) }
@@ -94,10 +165,15 @@ inner class WebAppInterface {
 @JavascriptInterface fun addMaster(table: String, name: String) { dbHelper.insertMaster(table, name) }
 @JavascriptInterface fun updateMaster(table: String, id: Int, name: String) { dbHelper.updateMaster(table, id, name) }
 @JavascriptInterface fun deleteMaster(table: String, id: Int) { dbHelper.deleteMaster(table, id) }
+@JavascriptInterface fun insertCategoryWithType(name: String, catType: String): Long = dbHelper.insertCategoryWithType(name, catType)
+@JavascriptInterface fun updateCategoryWithType(id: Int, name: String, catType: String) = dbHelper.updateCategoryWithType(id, name, catType)
 
-// ===== 支出 CRUD =====
+// ===== 支出・収入 CRUD =====
 @JavascriptInterface
-fun save(dataJson: String): Boolean {
+fun save(dataJson: String): Boolean = saveAndReturnId(dataJson) > 0L
+
+@JavascriptInterface
+fun saveAndReturnId(dataJson: String): Long {
 return try {
 val o = JSONObject(dataJson)
 val id = o.optInt("id", -1)
@@ -109,14 +185,24 @@ val date = o.optString("date", "")
 val pts = o.optString("points", "0")
 val cardId = o.optInt("card_id", 0)
 val createdAt = o.optString("created_at", "")
-if (id == -1) {
-dbHelper.insertExpense(name, price, cId, tIds, date, pts, cardId) != -1L
-} else {
-dbHelper.updateExpense(id, name, price, cId, tIds, date, pts, cardId, createdAt)
-true
-}
-} catch (e: Exception) { e.printStackTrace(); false }
-}
+            val entryType = o.optString("entry_type", "EXPENSE")
+            val taxRate = o.optInt("tax_rate", 0)
+            val invoiceFlag = o.optInt("invoice_flag", 0)
+            val settlementStatus = o.optString("settlement_status", "PAID")
+            val dueDate = o.optString("due_date", "")
+            if (id == -1) {
+                dbHelper.insertExpense(name, price, cId, tIds, date, pts, cardId, entryType, taxRate, invoiceFlag, settlementStatus, dueDate)
+            } else {
+                dbHelper.updateExpense(id, name, price, cId, tIds, date, pts, cardId, createdAt, entryType, taxRate, invoiceFlag, settlementStatus, dueDate)
+                id.toLong()
+            }
+        } catch (e: Exception) { e.printStackTrace(); -1L }
+    }
+
+// ===== 定型入力テンプレート (v35) =====
+@JavascriptInterface fun getInputTemplates(): String = dbHelper.getInputTemplates()
+@JavascriptInterface fun saveInputTemplate(tplJson: String): Long = dbHelper.saveInputTemplate(tplJson)
+@JavascriptInterface fun deleteInputTemplate(id: Int) = dbHelper.deleteInputTemplate(id)
 
 // ===== 履歴 =====
 @JavascriptInterface fun getRecords(offset: Int): String = dbHelper.getRecords(offset)
@@ -128,20 +214,24 @@ dbHelper.restoreLogs(IntArray(array.length()) { i -> array.getInt(i) })
 }
 @JavascriptInterface fun getTotal(mode: String): Int = dbHelper.getTotal(mode)
 @JavascriptInterface fun getTotalByRange(dateFrom: String, dateTo: String): Int = dbHelper.getTotalByRange(dateFrom, dateTo)
+@JavascriptInterface fun getCashflowByRange(dateFrom: String, dateTo: String): String = dbHelper.getCashflowByRange(dateFrom, dateTo)
 @JavascriptInterface fun getFixedCostsList(): String = dbHelper.getFixedCostsList()
 @JavascriptInterface fun getFixedCostsTotal(): Int = dbHelper.getFixedCostsTotal()
 @JavascriptInterface fun addFixedCost(name: String, amount: Int) = dbHelper.addFixedCost(name, amount)
 @JavascriptInterface fun updateFixedCost(id: Int, name: String, amount: Int) = dbHelper.updateFixedCost(id, name, amount)
 @JavascriptInterface fun deleteFixedCost(id: Int) = dbHelper.deleteFixedCost(id)
 @JavascriptInterface fun searchRecords(filterJson: String, offset: Int): String = dbHelper.searchRecords(filterJson, offset)
+@JavascriptInterface fun getSearchSummary(filterJson: String): String = dbHelper.getSearchSummary(filterJson)
+@JavascriptInterface fun getCalendarMonthSummary(ym: String, filterJson: String): String = dbHelper.getCalendarMonthSummary(ym, filterJson)
 
 // ===== 設定 =====
 @JavascriptInterface fun getSetting(key: String, default: String): String = dbHelper.getSetting(key, default)
 @JavascriptInterface fun setSetting(key: String, value: String) = dbHelper.setSetting(key, value)
 
-// ===== バックアップ =====
+// ===== バックアップ・CSV =====
 // E1/E3: アカウント名をファイル名・サブフォルダに使用
 @JavascriptInterface fun exportToFile(): String = dbHelper.exportToFile(currentAccountName())
+@JavascriptInterface fun exportCsvToFile(filterJson: String): String = dbHelper.exportCsvToFile(filterJson, currentAccountName())
 @JavascriptInterface fun importAll(jsonStr: String): String = dbHelper.importAll(jsonStr)
 
 @JavascriptInterface fun openImportFilePicker() {
@@ -171,7 +261,7 @@ fun cancelImport() {
 pendingImportJson = null
 }
 
-// ===== 予算管理 (v32) =====
+// ===== 予算管理 (v32 / v35) =====
 @JavascriptInterface
 fun getBudgetForPeriod(periodFrom: String, periodTo: String): String =
 dbHelper.getBudgetForPeriod(periodFrom, periodTo)
@@ -193,6 +283,17 @@ fun deleteBudgetExtra(id: Int) = dbHelper.deleteBudgetExtra(id)
 
 @JavascriptInterface
 fun getBudgetHistory(limit: Int): String = dbHelper.getBudgetHistory(limit)
+
+@JavascriptInterface
+fun getCategoryBudgets(periodFrom: String): String = dbHelper.getCategoryBudgets(periodFrom)
+
+@JavascriptInterface
+fun setCategoryBudget(periodFrom: String, categoryId: Int, amount: Int) =
+dbHelper.setCategoryBudget(periodFrom, categoryId, amount)
+
+@JavascriptInterface
+fun copyCategoryBudgets(fromPeriod: String, toPeriod: String) =
+dbHelper.copyCategoryBudgets(fromPeriod, toPeriod)
 
 // ===== 固定費履歴 (v32) =====
 @JavascriptInterface
@@ -220,9 +321,23 @@ dbHelper.changeFixedCostHistory(id, name, amount, categoryId, validFrom)
 fun getAccountInfo(): String {
 val arr = JSONArray()
 for (i in 1..3) {
+val isBiz = if (i == currentAccount) {
+dbHelper.getSetting("bizMode", "false") == "true"
+} else {
+val otherDbName = if (i == 1) "KakeiboDB" else "KakeiboDB_$i"
+var res = false
+val tempDb = DatabaseHelper(this@MainActivity, otherDbName)
+try {
+res = tempDb.getSetting("bizMode", "false") == "true"
+} finally {
+tempDb.close()
+}
+res
+}
 arr.put(JSONObject().apply {
-put("id",   i)
-put("name", prefs.getString("$KEY_ACCT_NAME$i", DEFAULT_NAMES[i - 1]) ?: DEFAULT_NAMES[i - 1])
+put("id",    i)
+put("name",  prefs.getString("$KEY_ACCT_NAME$i", DEFAULT_NAMES[i - 1]) ?: DEFAULT_NAMES[i - 1])
+put("isBiz", isBiz)
 })
 }
 return JSONObject().apply {
@@ -300,6 +415,10 @@ fun getMonthlyStatsByRangeFiltered(dateFrom: String, dateTo: String, filterJson:
 dbHelper.getMonthlyStatsByRange(dateFrom, dateTo, filterJson)
 
 @JavascriptInterface
+fun getMonthlyCashflowStats(dateFrom: String, dateTo: String, filterJson: String): String =
+dbHelper.getMonthlyCashflowStats(dateFrom, dateTo, filterJson)
+
+@JavascriptInterface
 fun getDailyStats(dateFrom: String, dateTo: String, filterJson: String): String =
 dbHelper.getDailyStats(dateFrom, dateTo, filterJson)
 
@@ -318,11 +437,22 @@ fun getCostTagStats(filterJson: String): String = dbHelper.getCostTagStats(filte
 @JavascriptInterface
 fun getEarliestExpenseDate(): String = dbHelper.getEarliestExpenseDate()
 
+// ===== v36: 売上管理モード専用 API =====
+@JavascriptInterface fun ensureDefaultCostTag(): Int = dbHelper.ensureDefaultCostTag()
+@JavascriptInterface fun getBizCashflowByRange(dateFrom: String, dateTo: String): String = dbHelper.getBizCashflowByRange(dateFrom, dateTo)
+@JavascriptInterface fun getBizCalendarMonthSummary(ym: String, filterJson: String): String = dbHelper.getBizCalendarMonthSummary(ym, filterJson)
+@JavascriptInterface fun getMemoSuggestions(prefix: String, limit: Int): String = dbHelper.getMemoSuggestions(prefix, limit)
+@JavascriptInterface fun markAsSettled(id: Int): Int = dbHelper.markAsSettled(id)
+@JavascriptInterface fun markManyAsSettled(idsJson: String): Int {
+return try {
+val arr = JSONArray(idsJson)
+dbHelper.markManyAsSettled(IntArray(arr.length()) { i -> arr.getInt(i) })
+} catch (e: Exception) { 0 }
+}
+@JavascriptInterface fun getUnpaidSummary(): String = dbHelper.getUnpaidSummary()
+@JavascriptInterface fun getAnnualTaxReport(year: Int): String = dbHelper.getAnnualTaxReport(year)
+
 // ===== システム =====
 @JavascriptInterface fun exitApp() { runOnUiThread { finish() } }
-}
-
-override fun onBackPressed() {
-webView.evaluateJavascript("handleBack()", null)
 }
 }
